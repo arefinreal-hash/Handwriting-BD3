@@ -209,6 +209,24 @@ export function isValidBdMobile(raw: string): boolean {
   return /^01[3-9]\d{8}$/.test(normalized);
 }
 
+export function generateQrToken(): string {
+  return crypto.randomBytes(24).toString('base64url');
+}
+
+export function generateTransactionId(): string {
+  const yr = new Date().getFullYear();
+  const rnd = crypto.randomBytes(5).toString('hex').toUpperCase();
+  return `HCFB-TXN-${yr}-${rnd}`;
+}
+
+export function hashOtp(otp: string, salt: string): string {
+  return crypto.createHmac('sha256', SESSION_SECRET).update(`${salt}:${otp}`).digest('hex');
+}
+
+export function hashIp(ip: string): string {
+  return crypto.createHash('sha256').update(ip || 'unknown').digest('hex').slice(0, 16);
+}
+
 export function logAudit(params: {
   actorId?: string | null;
   actorEmail?: string | null;
@@ -463,9 +481,97 @@ export async function initDatabase() {
       details TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS payment_transactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tran_id TEXT UNIQUE NOT NULL,
+      registration_pk INTEGER NOT NULL REFERENCES registrations(id) ON DELETE CASCADE,
+      registration_id TEXT NOT NULL,
+      competition_id INTEGER NOT NULL,
+      payment_method TEXT NOT NULL CHECK(payment_method IN ('bkash', 'nagad', 'rocket', 'free')),
+      amount REAL NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'BDT',
+      gateway_provider TEXT NOT NULL DEFAULT 'sslcommerz',
+      gateway_mode TEXT NOT NULL DEFAULT 'sandbox' CHECK(gateway_mode IN ('live', 'sandbox', 'free')),
+      is_test INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'PAID', 'FAILED', 'CANCELLED')),
+      val_id TEXT NOT NULL DEFAULT '',
+      bank_tran_id TEXT NOT NULL DEFAULT '',
+      card_type TEXT NOT NULL DEFAULT '',
+      gateway_session_key TEXT NOT NULL DEFAULT '',
+      gateway_raw_json TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      verified_at TEXT DEFAULT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS otp_verifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      registration_pk INTEGER NOT NULL REFERENCES registrations(id) ON DELETE CASCADE,
+      mobile TEXT NOT NULL,
+      otp_hash TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 5,
+      verified INTEGER NOT NULL DEFAULT 0,
+      delivery_mode TEXT NOT NULL DEFAULT 'sandbox_log',
+      expires_at TEXT NOT NULL,
+      last_sent_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS qr_verification_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      qr_token TEXT NOT NULL,
+      registration_pk INTEGER DEFAULT NULL,
+      registration_id TEXT NOT NULL DEFAULT '',
+      result_status TEXT NOT NULL CHECK(result_status IN ('AUTHENTIC', 'INVALID', 'REVOKED', 'PENDING')),
+      scanner_type TEXT NOT NULL DEFAULT 'public_web' CHECK(scanner_type IN ('public_web', 'organizer_scanner')),
+      scanned_by TEXT NOT NULL DEFAULT '',
+      ip_hash TEXT NOT NULL DEFAULT '',
+      user_agent TEXT NOT NULL DEFAULT '',
+      scanned_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS competition_attendance (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      registration_pk INTEGER NOT NULL REFERENCES registrations(id) ON DELETE CASCADE,
+      registration_id TEXT NOT NULL,
+      competition_id INTEGER NOT NULL REFERENCES competitions(id) ON DELETE CASCADE,
+      competition_edition TEXT NOT NULL DEFAULT '',
+      marked_by_id INTEGER NOT NULL,
+      marked_by_name TEXT NOT NULL,
+      notes TEXT NOT NULL DEFAULT '',
+      marked_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(registration_pk, competition_id)
+    );
   `);
 
+  const ensureColumn = (table: string, column: string, definition: string) => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  };
+
+  ensureColumn('competitions', 'registration_fee', 'REAL NOT NULL DEFAULT 200');
+  ensureColumn('registrations', 'date_of_birth', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('registrations', 'gender', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('registrations', 'full_address', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('registrations', 'sample_file_url', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('registrations', 'payment_method', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('registrations', 'payment_status', "TEXT NOT NULL DEFAULT 'UNPAID'");
+  ensureColumn('registrations', 'payment_amount', 'REAL NOT NULL DEFAULT 0');
+  ensureColumn('registrations', 'transaction_id', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('registrations', 'otp_verified', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('registrations', 'qr_token', 'TEXT DEFAULT NULL');
+  ensureColumn('registrations', 'qr_revoked', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('registrations', 'qr_revoked_reason', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('registrations', 'qr_issued_at', 'TEXT DEFAULT NULL');
+  ensureColumn('registrations', 'is_test_payment', 'INTEGER NOT NULL DEFAULT 0');
+
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_registrations_qr_token ON registrations(qr_token)');
+
   seedInitialData();
+  backfillSampleRegistrationPasses();
   } finally {
     txDepth -= 1;
     persistDb();
@@ -1083,3 +1189,69 @@ function seedInitialData() {
     );
   }
 }
+
+function backfillSampleRegistrationPasses() {
+  const sampleRows = db
+    .prepare(
+      `SELECT id, registration_id, competition_id, status, qr_token, payment_status, transaction_id
+       FROM registrations
+       WHERE is_sample = 1 AND qr_token IS NULL`
+    )
+    .all() as Array<{
+    id: number;
+    registration_id: string;
+    competition_id: number;
+    status: string;
+    qr_token: string | null;
+    payment_status: string;
+    transaction_id: string;
+  }>;
+
+  if (sampleRows.length === 0) return;
+
+  const updReg = db.prepare(`
+    UPDATE registrations
+    SET date_of_birth = CASE WHEN date_of_birth = '' THEN '2012-05-14' ELSE date_of_birth END,
+        gender = CASE WHEN gender = '' THEN 'Male' ELSE gender END,
+        full_address = CASE WHEN full_address = '' THEN district || ', Bangladesh' ELSE full_address END,
+        payment_method = ?,
+        payment_status = ?,
+        payment_amount = ?,
+        transaction_id = ?,
+        otp_verified = ?,
+        qr_token = ?,
+        qr_issued_at = datetime('now'),
+        is_test_payment = 1
+    WHERE id = ?
+  `);
+
+  const insTxn = db.prepare(`
+    INSERT OR IGNORE INTO payment_transactions (
+      tran_id, registration_pk, registration_id, competition_id, payment_method,
+      amount, currency, gateway_provider, gateway_mode, is_test, status, verified_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 'BDT', 'sslcommerz', 'sandbox', 1, ?, ?)
+  `);
+
+  for (let idx = 0; idx < sampleRows.length; idx++) {
+    const r = sampleRows[idx];
+    const isPaid = r.registration_id !== 'HCFB-2026-00003';
+    const method = idx % 3 === 0 ? 'bkash' : idx % 3 === 1 ? 'nagad' : 'rocket';
+    const payStatus = isPaid ? 'PAID' : 'PENDING';
+    const tranId = r.transaction_id || `HCFB-TXN-2026-SAMPLE0${idx + 1}`;
+    const token = generateQrToken();
+    const amount = 200;
+
+    updReg.run(method, payStatus, amount, tranId, isPaid ? 1 : 0, token, r.id);
+    insTxn.run(
+      tranId,
+      r.id,
+      r.registration_id,
+      r.competition_id,
+      method,
+      amount,
+      payStatus,
+      isPaid ? new Date().toISOString() : null
+    );
+  }
+}
+

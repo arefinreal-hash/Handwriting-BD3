@@ -2,6 +2,7 @@ import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import multer from 'multer';
 import QRCode from 'qrcode';
 import dotenv from 'dotenv';
@@ -14,9 +15,21 @@ import {
   verifyToken,
   normalizeBdMobile,
   isValidBdMobile,
+  generateQrToken,
+  generateTransactionId,
+  hashOtp,
+  hashIp,
   logAudit,
 } from './src/server/db.ts';
 import type { TokenPayload } from './src/server/db.ts';
+import {
+  generateEntryPassPdfBuffer,
+  getPaymentGatewayConfig,
+  initSslcommerzSession,
+  validateSslcommerzTransaction,
+  dispatchSmsOtp,
+  sendRegistrationConfirmationEmail,
+} from './src/server/passAndMailer.ts';
 
 dotenv.config();
 
@@ -28,7 +41,30 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 }
 
 app.use(express.json({ limit: '4mb' }));
+app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(UPLOADS_DIR));
+
+function resolveAppOrigin(req: Request): string {
+  if (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL') {
+    return process.env.APP_URL.replace(/\/+$/, '');
+  }
+  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0].trim();
+  return `${proto}://${req.get('host')}`;
+}
+
+// In-memory rate limiter for anti-fraud QR verification & OTP endpoints
+const rateBucket = new Map<string, number[]>();
+function checkRateLimit(key: string, maxRequests: number, windowMs: number): boolean {
+  const now = Date.now();
+  const list = (rateBucket.get(key) || []).filter((ts) => now - ts < windowMs);
+  if (list.length >= maxRequests) {
+    rateBucket.set(key, list);
+    return false;
+  }
+  list.push(now);
+  rateBucket.set(key, list);
+  return true;
+}
 
 // Safe file upload validation
 const ALLOWED_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'application/pdf']);
@@ -391,7 +427,965 @@ app.get('/api/public/hub/:id/pdf', (req, res) => {
   res.send(pdfBuf);
 });
 
-// ==================== PUBLIC REGISTRATION & TRACKING ====================
+// ==================== MULTI-STEP REGISTRATION, PAYMENT, OTP & ANTI-FRAUD QR ====================
+
+app.post('/api/public/upload-sample', upload.single('file'), (req, res) => {
+  if (!req.file) {
+    res.status(400).json({ error: 'Please attach a valid JPG, PNG, WEBP, or PDF file (max 5MB).' });
+    return;
+  }
+  res.status(201).json({
+    url: `/uploads/${req.file.filename}`,
+    filename: req.file.originalname,
+  });
+});
+
+async function finalizePaidRegistration(params: {
+  origin: string;
+  tranId: string;
+  valId?: string;
+  bankTranId?: string;
+  cardType?: string;
+  isTest: boolean;
+  gatewayRaw?: unknown;
+}) {
+  const txn = db
+    .prepare('SELECT * FROM payment_transactions WHERE tran_id = ?')
+    .get(params.tranId) as Record<string, unknown> | undefined;
+  if (!txn) return null;
+
+  const reg = db
+    .prepare(
+      `SELECT r.*, c.title_bn as comp_bn, c.title_en as comp_en, c.competition_date,
+              cat.name_bn as cat_bn, cat.name_en as cat_en
+       FROM registrations r
+       JOIN competitions c ON c.id = r.competition_id
+       JOIN competition_categories cat ON cat.id = r.category_id
+       WHERE r.id = ?`
+    )
+    .get(Number(txn.registration_pk)) as Record<string, unknown> | undefined;
+  if (!reg) return null;
+
+  const qrToken = reg.qr_token ? String(reg.qr_token) : generateQrToken();
+  const nowIso = new Date().toISOString();
+
+  if (txn.status !== 'PAID') {
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE payment_transactions
+         SET status = 'PAID',
+             val_id = ?,
+             bank_tran_id = ?,
+             card_type = ?,
+             is_test = ?,
+             gateway_raw_json = ?,
+             verified_at = datetime('now')
+         WHERE tran_id = ?`
+      ).run(
+        params.valId || '',
+        params.bankTranId || '',
+        params.cardType || '',
+        params.isTest ? 1 : 0,
+        params.gatewayRaw ? JSON.stringify(params.gatewayRaw) : '',
+        params.tranId
+      );
+
+      db.prepare(
+        `UPDATE registrations
+         SET payment_status = 'PAID',
+             payment_method = ?,
+             payment_amount = ?,
+             transaction_id = ?,
+             is_test_payment = ?,
+             status = CASE WHEN status = 'pending' THEN 'verified' ELSE status END,
+             qr_token = COALESCE(qr_token, ?),
+             qr_issued_at = COALESCE(qr_issued_at, datetime('now')),
+             updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(
+        String(txn.payment_method),
+        Number(txn.amount),
+        params.tranId,
+        params.isTest ? 1 : 0,
+        qrToken,
+        Number(reg.id)
+      );
+    })();
+  }
+
+  const verifyUrl = `${params.origin}/verify/${encodeURIComponent(qrToken)}`;
+  const emailTo = String(reg.email || '').trim();
+  let emailStatus = String(reg.email_dispatch_status || 'not_provided');
+
+  if (emailTo && emailStatus !== 'sent_smtp') {
+    try {
+      const pdfBuf = await generateEntryPassPdfBuffer({
+        registrationId: String(reg.registration_id),
+        participantNameEn: String(reg.name_en || reg.name_bn),
+        participantNameBn: String(reg.name_bn || ''),
+        institutionName: String(reg.school_name || ''),
+        classLevel: String(reg.class_level || ''),
+        competitionTitleEn: String(reg.comp_en || reg.comp_bn),
+        competitionDate: String(reg.competition_date || ''),
+        categoryNameEn: String(reg.cat_en || reg.cat_bn),
+        transactionId: params.tranId,
+        paymentMethod: String(txn.payment_method),
+        paymentStatus: 'PAID',
+        paymentAmount: Number(txn.amount),
+        isTestPayment: params.isTest,
+        registeredAt: String(reg.created_at || nowIso),
+        qrToken,
+        verifyUrl,
+      });
+      emailStatus = await sendRegistrationConfirmationEmail({
+        to: emailTo,
+        participantName: String(reg.name_en || reg.name_bn),
+        registrationId: String(reg.registration_id),
+        competitionTitle: String(reg.comp_en || reg.comp_bn),
+        categoryName: String(reg.cat_en || reg.cat_bn),
+        transactionId: params.tranId,
+        verifyUrl,
+        pdfBuffer: pdfBuf,
+      });
+      db.prepare('UPDATE registrations SET email_dispatch_status = ? WHERE id = ?').run(emailStatus, Number(reg.id));
+    } catch {
+      // non-fatal
+    }
+  }
+
+  return {
+    registration_id: String(reg.registration_id),
+    tran_id: params.tranId,
+    qr_token: qrToken,
+    verify_url: verifyUrl,
+    email_status: emailStatus,
+  };
+}
+
+// Step 1 + Step 2: Initiate Registration Draft, Create Transaction & Send Registration Mobile OTP
+app.post('/api/public/registrations/initiate', async (req, res) => {
+  const body = req.body as Record<string, unknown>;
+
+  const name_en = String(body.name_en || body.full_name || '').trim();
+  const name_bn = String(body.name_bn || '').trim() || name_en;
+  const father_name = String(body.father_name || '').trim();
+  const mother_name = String(body.mother_name || '').trim();
+  const date_of_birth = String(body.date_of_birth || '').trim();
+  const gender = String(body.gender || '').trim();
+  const school_name = String(body.school_name || '').trim();
+  const class_level = String(body.class_level || '').trim();
+  const rawMobile = String(body.mobile || '').trim();
+  const email = String(body.email || '').trim();
+  const full_address = String(body.full_address || '').trim();
+  const district = String(body.district || 'Dhaka').trim();
+  const competition_id = Number(body.competition_id);
+  const category_id = Number(body.category_id);
+  const sample_file_url = String(body.sample_file_url || '').trim();
+  const payment_method = String(body.payment_method || '').trim().toLowerCase();
+  const privacy_consent = body.privacy_consent !== false;
+
+  const errors: Record<string, string> = {};
+  if (name_en.length < 2) errors.name_en = "Participant's full name is required.";
+  if (father_name.length < 2) errors.father_name = "Father's name is required.";
+  if (mother_name.length < 2) errors.mother_name = "Mother's name is required.";
+  if (!date_of_birth) errors.date_of_birth = 'Date of birth is required.';
+  if (!['Male', 'Female', 'Other'].includes(gender)) errors.gender = 'Please select gender.';
+  if (school_name.length < 2) errors.school_name = 'Institution / School name is required.';
+  if (class_level.length < 1) errors.class_level = 'Class / Grade is required.';
+  if (!isValidBdMobile(rawMobile)) errors.mobile = 'Enter a valid 11-digit Bangladeshi mobile number (01XXXXXXXXX).';
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.email = 'Enter a valid email address.';
+  if (full_address.length < 5) errors.full_address = 'Full address is required.';
+  if (!competition_id) errors.competition_id = 'Competition selection is required.';
+  if (!category_id) errors.category_id = 'Competition category is required.';
+  if (!['bkash', 'nagad', 'rocket'].includes(payment_method)) errors.payment_method = 'Select bKash, Nagad, or Rocket.';
+  if (!privacy_consent) errors.privacy_consent = 'Consent to terms & privacy policy is required.';
+
+  if (Object.keys(errors).length > 0) {
+    res.status(400).json({ error: 'Please fix the highlighted fields.', fields: errors });
+    return;
+  }
+
+  const mobile = normalizeBdMobile(rawMobile);
+  const comp = db.prepare('SELECT * FROM competitions WHERE id = ?').get(competition_id) as
+    | {
+        id: number;
+        title_bn: string;
+        title_en: string;
+        status: string;
+        registration_deadline: string;
+        registration_fee: number;
+      }
+    | undefined;
+
+  if (!comp || comp.status !== 'published') {
+    res.status(400).json({ error: 'Registration for this competition is currently closed.' });
+    return;
+  }
+
+  const deadlineMs = new Date(comp.registration_deadline + 'T23:59:59').getTime();
+  if (!Number.isNaN(deadlineMs) && Date.now() > deadlineMs) {
+    res.status(400).json({ error: 'The registration deadline for this competition has passed.' });
+    return;
+  }
+
+  const cat = db
+    .prepare('SELECT * FROM competition_categories WHERE id = ? AND competition_id = ?')
+    .get(category_id, competition_id) as { id: number; name_bn: string; name_en: string } | undefined;
+  if (!cat) {
+    res.status(400).json({ error: 'Selected competition category does not exist.' });
+    return;
+  }
+
+  const gwCfg = getPaymentGatewayConfig();
+  const feeAmount = Number(comp.registration_fee ?? 0);
+  if (feeAmount > 0 && !gwCfg.configured && !gwCfg.sandboxAllowed) {
+    res.status(503).json({
+      error:
+        'Live payment gateway credentials (SSLCOMMERZ_STORE_ID / SSLCOMMERZ_STORE_PASSWD) are not configured on the server.',
+    });
+    return;
+  }
+
+  // Prevent duplicate PAID registrations
+  const paidDuplicate = db
+    .prepare(
+      `SELECT registration_id FROM registrations
+       WHERE competition_id = ? AND mobile = ? AND LOWER(TRIM(name_en)) = LOWER(TRIM(?)) AND payment_status = 'PAID'`
+    )
+    .get(competition_id, mobile, name_en) as { registration_id: string } | undefined;
+
+  if (paidDuplicate) {
+    res.status(409).json({
+      error: `A paid registration already exists for this participant and mobile number (ID: ${paidDuplicate.registration_id}).`,
+      existing_registration_id: paidDuplicate.registration_id,
+    });
+    return;
+  }
+
+  const ipKey = `init:${hashIp(req.ip || '')}`;
+  if (!checkRateLimit(ipKey, 20, 60_000)) {
+    res.status(429).json({ error: 'Too many registration attempts. Please wait a minute and try again.' });
+    return;
+  }
+
+  const result = db.transaction(() => {
+    // Reuse unpaid pending draft for same participant+mobile+competition if one exists
+    const existingDraft = db
+      .prepare(
+        `SELECT id, registration_id FROM registrations
+         WHERE competition_id = ? AND mobile = ? AND LOWER(TRIM(name_en)) = LOWER(TRIM(?)) AND payment_status != 'PAID'`
+      )
+      .get(competition_id, mobile, name_en) as { id: number; registration_id: string } | undefined;
+
+    let regPk: number;
+    let regId: string;
+    const tranId = generateTransactionId();
+    const effectiveMethod = feeAmount <= 0 ? 'free' : (payment_method as 'bkash' | 'nagad' | 'rocket');
+    const gatewayMode = feeAmount <= 0 ? 'free' : gwCfg.mode;
+
+    if (existingDraft) {
+      regPk = existingDraft.id;
+      regId = existingDraft.registration_id;
+      db.prepare(
+        `UPDATE registrations
+         SET category_id = ?, name_bn = ?, name_en = ?, father_name = ?, mother_name = ?,
+             date_of_birth = ?, gender = ?, school_name = ?, class_level = ?, email = ?,
+             full_address = ?, district = ?, sample_file_url = ?, payment_method = ?,
+             payment_status = 'PENDING', payment_amount = ?, transaction_id = ?,
+             otp_verified = 0, updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(
+        category_id,
+        name_bn,
+        name_en,
+        father_name,
+        mother_name,
+        date_of_birth,
+        gender,
+        school_name,
+        class_level,
+        email,
+        full_address,
+        district,
+        sample_file_url,
+        effectiveMethod,
+        feeAmount,
+        tranId,
+        regPk
+      );
+    } else {
+      const year = new Date().getFullYear();
+      const prefix = `HCFB-${year}-`;
+      const lastRow = db
+        .prepare('SELECT registration_id FROM registrations WHERE registration_id LIKE ? ORDER BY id DESC LIMIT 1')
+        .get(`${prefix}%`) as { registration_id: string } | undefined;
+      let nextSeq = 1;
+      if (lastRow) {
+        const parsed = Number(lastRow.registration_id.split('-')[2]);
+        if (!Number.isNaN(parsed)) nextSeq = parsed + 1;
+      }
+      regId = `${prefix}${String(nextSeq).padStart(5, '0')}`;
+
+      const ins = db
+        .prepare(
+          `INSERT INTO registrations (
+            registration_id, competition_id, category_id, name_bn, name_en,
+            father_name, mother_name, date_of_birth, gender, school_name, class_level,
+            mobile, alt_mobile, email, full_address, district, upazila,
+            participant_type, sample_file_url, guardian_consent, privacy_consent,
+            status, payment_method, payment_status, payment_amount, transaction_id,
+            otp_verified, is_test_payment, is_sample
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, '', 'Student', ?, 1, 1, 'pending', ?, 'PENDING', ?, ?, 0, ?, 0)`
+        )
+        .run(
+          regId,
+          competition_id,
+          category_id,
+          name_bn,
+          name_en,
+          father_name,
+          mother_name,
+          date_of_birth,
+          gender,
+          school_name,
+          class_level,
+          mobile,
+          email,
+          full_address,
+          district,
+          sample_file_url,
+          effectiveMethod,
+          feeAmount,
+          tranId,
+          gwCfg.isLive ? 0 : 1
+        );
+      regPk = ins.lastInsertRowid;
+    }
+
+    db.prepare(
+      `INSERT INTO payment_transactions (
+        tran_id, registration_pk, registration_id, competition_id,
+        payment_method, amount, currency, gateway_provider, gateway_mode, is_test, status
+      ) VALUES (?, ?, ?, ?, ?, ?, 'BDT', 'sslcommerz', ?, ?, 'PENDING')`
+    ).run(
+      tranId,
+      regPk,
+      regId,
+      competition_id,
+      effectiveMethod,
+      feeAmount,
+      gatewayMode,
+      gwCfg.isLive ? 0 : 1
+    );
+
+    return { regPk, regId, tranId, effectiveMethod, gatewayMode };
+  })();
+
+  // Issue 6-digit registration verification OTP (separate from payment wallet PIN/OTP)
+  const otpCode = String(crypto.randomInt(100000, 1000000));
+  const smsResult = await dispatchSmsOtp(mobile, otpCode);
+  const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+
+  db.prepare(
+    `INSERT INTO otp_verifications (registration_pk, mobile, otp_hash, delivery_mode, expires_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(result.regPk, mobile, hashOtp(otpCode, result.tranId), smsResult.mode, expiresAt);
+
+  res.status(201).json({
+    success: true,
+    registration_id: result.regId,
+    tran_id: result.tranId,
+    amount: feeAmount,
+    currency: 'BDT',
+    payment_method: result.effectiveMethod,
+    gateway_mode: result.gatewayMode,
+    gateway_configured: gwCfg.configured,
+    is_live_gateway: gwCfg.isLive && gwCfg.configured,
+    otp_required: true,
+    otp_delivery_mode: smsResult.mode,
+    resend_cooldown: 60,
+    ...(smsResult.mode === 'sandbox_log' ? { sandbox_otp_preview: otpCode } : {}),
+  });
+});
+
+app.post('/api/public/otp/resend', async (req, res) => {
+  const tranId = String((req.body as { tran_id?: string }).tran_id || '').trim();
+  if (!tranId) {
+    res.status(400).json({ error: 'Transaction ID is required.' });
+    return;
+  }
+
+  const txn = db
+    .prepare('SELECT registration_pk, status FROM payment_transactions WHERE tran_id = ?')
+    .get(tranId) as { registration_pk: number; status: string } | undefined;
+  if (!txn || txn.status === 'PAID') {
+    res.status(400).json({ error: 'Invalid or already completed transaction.' });
+    return;
+  }
+
+  const latestOtp = db
+    .prepare('SELECT * FROM otp_verifications WHERE registration_pk = ? ORDER BY id DESC LIMIT 1')
+    .get(txn.registration_pk) as { id: number; mobile: string; last_sent_at: string } | undefined;
+
+  if (latestOtp) {
+    const sentMs = new Date(latestOtp.last_sent_at + (latestOtp.last_sent_at.endsWith('Z') ? '' : 'Z')).getTime();
+    const elapsedSec = Math.floor((Date.now() - sentMs) / 1000);
+    if (!Number.isNaN(elapsedSec) && elapsedSec < 58) {
+      res.status(429).json({
+        error: `Please wait ${60 - elapsedSec} seconds before requesting another OTP.`,
+        retry_after: 60 - elapsedSec,
+      });
+      return;
+    }
+  }
+
+  const reg = db
+    .prepare('SELECT mobile FROM registrations WHERE id = ?')
+    .get(txn.registration_pk) as { mobile: string } | undefined;
+  if (!reg) {
+    res.status(404).json({ error: 'Registration not found.' });
+    return;
+  }
+
+  const otpCode = String(crypto.randomInt(100000, 1000000));
+  const smsResult = await dispatchSmsOtp(reg.mobile, otpCode);
+  const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+
+  db.prepare(
+    `INSERT INTO otp_verifications (registration_pk, mobile, otp_hash, delivery_mode, expires_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(txn.registration_pk, reg.mobile, hashOtp(otpCode, tranId), smsResult.mode, expiresAt);
+
+  res.json({
+    success: true,
+    resend_cooldown: 60,
+    otp_delivery_mode: smsResult.mode,
+    ...(smsResult.mode === 'sandbox_log' ? { sandbox_otp_preview: otpCode } : {}),
+  });
+});
+
+app.post('/api/public/otp/verify', async (req, res) => {
+  const { tran_id, otp } = req.body as { tran_id?: string; otp?: string };
+  const tranId = String(tran_id || '').trim();
+  const cleanOtp = String(otp || '').trim();
+
+  if (!tranId || !/^\d{6}$/.test(cleanOtp)) {
+    res.status(400).json({ error: 'Enter a valid 6-digit registration verification OTP.' });
+    return;
+  }
+
+  const txn = db
+    .prepare(
+      `SELECT pt.*, r.name_en, r.email, r.mobile, r.full_address, r.district,
+              c.title_en as comp_en, cat.name_en as cat_en
+       FROM payment_transactions pt
+       JOIN registrations r ON r.id = pt.registration_pk
+       JOIN competitions c ON c.id = pt.competition_id
+       JOIN competition_categories cat ON cat.id = r.category_id
+       WHERE pt.tran_id = ?`
+    )
+    .get(tranId) as Record<string, unknown> | undefined;
+
+  if (!txn) {
+    res.status(404).json({ error: 'Payment session not found.' });
+    return;
+  }
+
+  const otpRow = db
+    .prepare('SELECT * FROM otp_verifications WHERE registration_pk = ? ORDER BY id DESC LIMIT 1')
+    .get(Number(txn.registration_pk)) as
+    | {
+        id: number;
+        otp_hash: string;
+        attempts: number;
+        max_attempts: number;
+        verified: number;
+        expires_at: string;
+      }
+    | undefined;
+
+  if (!otpRow) {
+    res.status(400).json({ error: 'No active OTP session found. Please resend OTP.' });
+    return;
+  }
+
+  if (otpRow.attempts >= otpRow.max_attempts) {
+    res.status(429).json({
+      error: 'Maximum OTP attempts exceeded. Please request a new OTP after the countdown.',
+      locked: true,
+    });
+    return;
+  }
+
+  if (new Date(otpRow.expires_at).getTime() < Date.now()) {
+    res.status(400).json({ error: 'OTP has expired. Please request a new code.' });
+    return;
+  }
+
+  const expectedHash = hashOtp(cleanOtp, tranId);
+  const actualBuf = Buffer.from(expectedHash, 'hex');
+  const storedBuf = Buffer.from(otpRow.otp_hash, 'hex');
+  const isMatch = actualBuf.length === storedBuf.length && crypto.timingSafeEqual(actualBuf, storedBuf);
+
+  if (!isMatch) {
+    const nextAttempts = otpRow.attempts + 1;
+    db.prepare('UPDATE otp_verifications SET attempts = ? WHERE id = ?').run(nextAttempts, otpRow.id);
+    const remaining = Math.max(0, otpRow.max_attempts - nextAttempts);
+    res.status(400).json({
+      error:
+        remaining > 0
+          ? `Incorrect OTP code. ${remaining} attempt(s) remaining.`
+          : 'Incorrect OTP code. Maximum attempts reached; please resend OTP.',
+      remaining_attempts: remaining,
+    });
+    return;
+  }
+
+  db.transaction(() => {
+    db.prepare('UPDATE otp_verifications SET verified = 1 WHERE id = ?').run(otpRow.id);
+    db.prepare('UPDATE registrations SET otp_verified = 1 WHERE id = ?').run(Number(txn.registration_pk));
+  })();
+
+  const amount = Number(txn.amount || 0);
+  const origin = resolveAppOrigin(req);
+
+  if (amount <= 0) {
+    const finalized = await finalizePaidRegistration({
+      origin,
+      tranId,
+      isTest: false,
+    });
+    res.json({
+      success: true,
+      next_action: 'confirmed',
+      tran_id: tranId,
+      registration_id: finalized?.registration_id,
+    });
+    return;
+  }
+
+  const gwCfg = getPaymentGatewayConfig();
+  if (gwCfg.configured) {
+    const session = await initSslcommerzSession({
+      origin,
+      tranId,
+      amount,
+      method: String(txn.payment_method) as 'bkash' | 'nagad' | 'rocket',
+      participantName: String(txn.name_en || 'Participant'),
+      email: String(txn.email || ''),
+      mobile: String(txn.mobile || ''),
+      address: String(txn.full_address || ''),
+      district: String(txn.district || 'Dhaka'),
+      competitionTitle: String(txn.comp_en || 'HCFB Competition'),
+      categoryName: String(txn.cat_en || 'General'),
+    });
+
+    if (!session.ok || !session.gatewayUrl) {
+      res.status(502).json({
+        error: session.error || 'Could not establish SSLCOMMERZ payment gateway session.',
+      });
+      return;
+    }
+
+    db.prepare('UPDATE payment_transactions SET gateway_session_key = ? WHERE tran_id = ?').run(
+      session.sessionKey || '',
+      tranId
+    );
+
+    res.json({
+      success: true,
+      next_action: 'gateway_redirect',
+      gateway_url: session.gatewayUrl,
+      gateway_mode: gwCfg.mode,
+      tran_id: tranId,
+    });
+    return;
+  }
+
+  if (!gwCfg.sandboxAllowed) {
+    res.status(503).json({ error: 'Live payment gateway is not configured.' });
+    return;
+  }
+
+  res.json({
+    success: true,
+    next_action: 'sandbox_gateway',
+    gateway_mode: 'sandbox',
+    tran_id: tranId,
+    amount,
+    payment_method: String(txn.payment_method),
+  });
+});
+
+// SSLCOMMERZ Gateway Server Callbacks (Live & Sandbox Merchant)
+app.post('/api/payments/sslcommerz/success', async (req, res) => {
+  const tranId = String(req.body.tran_id || req.query.tran_id || '').trim();
+  const valId = String(req.body.val_id || req.query.val_id || '').trim();
+  const origin = resolveAppOrigin(req);
+
+  const txn = db.prepare('SELECT * FROM payment_transactions WHERE tran_id = ?').get(tranId) as
+    | { amount: number; currency: string; is_test: number }
+    | undefined;
+  if (!txn) {
+    res.redirect(`/register?payment_result=failed&reason=missing_transaction`);
+    return;
+  }
+
+  const validation = await validateSslcommerzTransaction(valId);
+  if (
+    !validation.valid ||
+    validation.tranId !== tranId ||
+    Math.abs(Number(validation.amount || 0) - Number(txn.amount)) > 1
+  ) {
+    db.prepare("UPDATE payment_transactions SET status = 'FAILED', gateway_raw_json = ? WHERE tran_id = ?").run(
+      JSON.stringify(validation.raw || req.body || {}),
+      tranId
+    );
+    res.redirect(`/register?payment_result=failed&tran_id=${encodeURIComponent(tranId)}`);
+    return;
+  }
+
+  await finalizePaidRegistration({
+    origin,
+    tranId,
+    valId,
+    bankTranId: validation.bankTranId,
+    cardType: validation.cardType,
+    isTest: !getPaymentGatewayConfig().isLive,
+    gatewayRaw: validation.raw,
+  });
+
+  res.redirect(`/register?payment_result=success&tran_id=${encodeURIComponent(tranId)}`);
+});
+
+app.post('/api/payments/sslcommerz/ipn', async (req, res) => {
+  const tranId = String(req.body.tran_id || '').trim();
+  const valId = String(req.body.val_id || '').trim();
+  if (!tranId || !valId) {
+    res.status(400).json({ error: 'Invalid IPN payload' });
+    return;
+  }
+  const txn = db.prepare('SELECT * FROM payment_transactions WHERE tran_id = ?').get(tranId) as
+    | { amount: number }
+    | undefined;
+  if (!txn) {
+    res.status(404).json({ error: 'Transaction not found' });
+    return;
+  }
+  const validation = await validateSslcommerzTransaction(valId);
+  if (validation.valid && validation.tranId === tranId && Math.abs(Number(validation.amount || 0) - Number(txn.amount)) <= 1) {
+    await finalizePaidRegistration({
+      origin: resolveAppOrigin(req),
+      tranId,
+      valId,
+      bankTranId: validation.bankTranId,
+      cardType: validation.cardType,
+      isTest: !getPaymentGatewayConfig().isLive,
+      gatewayRaw: validation.raw,
+    });
+    res.json({ status: 'VALIDATED' });
+    return;
+  }
+  res.status(400).json({ status: 'INVALID' });
+});
+
+app.post('/api/payments/sslcommerz/fail', (req, res) => {
+  const tranId = String(req.body.tran_id || req.query.tran_id || '').trim();
+  if (tranId) {
+    db.prepare("UPDATE payment_transactions SET status = 'FAILED' WHERE tran_id = ? AND status = 'PENDING'").run(tranId);
+    db.prepare("UPDATE registrations SET payment_status = 'FAILED' WHERE transaction_id = ? AND payment_status = 'PENDING'").run(
+      tranId
+    );
+  }
+  res.redirect(`/register?payment_result=failed&tran_id=${encodeURIComponent(tranId)}`);
+});
+
+app.post('/api/payments/sslcommerz/cancel', (req, res) => {
+  const tranId = String(req.body.tran_id || req.query.tran_id || '').trim();
+  if (tranId) {
+    db.prepare("UPDATE payment_transactions SET status = 'CANCELLED' WHERE tran_id = ? AND status = 'PENDING'").run(
+      tranId
+    );
+    db.prepare("UPDATE registrations SET payment_status = 'CANCELLED' WHERE transaction_id = ? AND payment_status = 'PENDING'").run(
+      tranId
+    );
+  }
+  res.redirect(`/register?payment_result=cancelled&tran_id=${encodeURIComponent(tranId)}`);
+});
+
+// Sandbox / Development Test Mode Gateway Verification (strictly blocked if live credentials or strict prod disable sandbox)
+app.post('/api/payments/sandbox/verify', async (req, res) => {
+  const gwCfg = getPaymentGatewayConfig();
+  if (gwCfg.configured && gwCfg.isLive) {
+    res.status(403).json({ error: 'Sandbox verification is disabled in Live Gateway mode.' });
+    return;
+  }
+  if (!gwCfg.sandboxAllowed) {
+    res.status(403).json({ error: 'Payment sandbox is disabled in this environment.' });
+    return;
+  }
+
+  const { tran_id, outcome } = req.body as { tran_id?: string; outcome?: 'success' | 'fail' };
+  const tranId = String(tran_id || '').trim();
+  if (!tranId) {
+    res.status(400).json({ error: 'Transaction ID is required.' });
+    return;
+  }
+
+  const txn = db
+    .prepare(
+      `SELECT pt.*, r.otp_verified
+       FROM payment_transactions pt
+       JOIN registrations r ON r.id = pt.registration_pk
+       WHERE pt.tran_id = ?`
+    )
+    .get(tranId) as { registration_pk: number; status: string; otp_verified: number } | undefined;
+
+  if (!txn) {
+    res.status(404).json({ error: 'Transaction record not found.' });
+    return;
+  }
+
+  if (txn.otp_verified !== 1) {
+    res.status(403).json({ error: 'Mobile OTP verification must be completed before payment verification.' });
+    return;
+  }
+
+  if (outcome === 'fail') {
+    db.prepare("UPDATE payment_transactions SET status = 'FAILED' WHERE tran_id = ? AND status = 'PENDING'").run(tranId);
+    db.prepare("UPDATE registrations SET payment_status = 'FAILED' WHERE id = ? AND payment_status != 'PAID'").run(
+      txn.registration_pk
+    );
+    res.status(400).json({ error: 'Sandbox payment marked as FAILED.' });
+    return;
+  }
+
+  const finalized = await finalizePaidRegistration({
+    origin: resolveAppOrigin(req),
+    tranId,
+    valId: `SANDBOX-${crypto.randomBytes(4).toString('hex').toUpperCase()}`,
+    bankTranId: `SBX-${Date.now()}`,
+    cardType: 'SANDBOX_MFS',
+    isTest: true,
+    gatewayRaw: { sandbox: true, verifiedAt: new Date().toISOString() },
+  });
+
+  res.json({
+    success: true,
+    ...finalized,
+  });
+});
+
+// Safe Payment & Registration Confirmation Lookup for Step 4
+app.get('/api/public/payment-status/:tranId', async (req, res) => {
+  const tranId = String(req.params.tranId || '').trim();
+  const row = db
+    .prepare(
+      `SELECT pt.tran_id, pt.payment_method, pt.amount, pt.currency, pt.gateway_mode, pt.is_test, pt.status as txn_status, pt.verified_at,
+              r.registration_id, r.name_bn, r.name_en, r.school_name, r.class_level, r.district,
+              r.payment_status, r.qr_token, r.qr_revoked, r.created_at, r.email_dispatch_status,
+              c.title_bn as competition_title_bn, c.title_en as competition_title_en, c.competition_date,
+              cat.name_bn as category_name_bn, cat.name_en as category_name_en
+       FROM payment_transactions pt
+       JOIN registrations r ON r.id = pt.registration_pk
+       JOIN competitions c ON c.id = r.competition_id
+       JOIN competition_categories cat ON cat.id = r.category_id
+       WHERE pt.tran_id = ?`
+    )
+    .get(tranId) as Record<string, unknown> | undefined;
+
+  if (!row) {
+    res.status(404).json({ error: 'Transaction record not found.' });
+    return;
+  }
+
+  const origin = resolveAppOrigin(req);
+  const qrToken = String(row.qr_token || '');
+  const verifyUrl = qrToken ? `${origin}/verify/${encodeURIComponent(qrToken)}` : '';
+  const qrDataUrl = verifyUrl
+    ? await QRCode.toDataURL(verifyUrl, {
+        width: 240,
+        margin: 1,
+        errorCorrectionLevel: 'H',
+        color: { dark: '#04241D', light: '#FFFFFF' },
+      })
+    : '';
+
+  res.json({
+    confirmation: {
+      ...row,
+      verify_url: verifyUrl,
+      qr_data_url: qrDataUrl,
+    },
+  });
+});
+
+// Official High-Resolution PDF Competition Entry Pass Download (Requires cryptographic QR token)
+app.get('/api/public/registrations/:regId/entry-pass.pdf', async (req, res) => {
+  const regId = String(req.params.regId || '').trim().toUpperCase();
+  const token = String(req.query.token || '').trim();
+  if (!regId || !token) {
+    res.status(403).json({ error: 'A valid verification token is required to download this Entry Pass.' });
+    return;
+  }
+
+  const reg = db
+    .prepare(
+      `SELECT r.*, c.title_bn as comp_bn, c.title_en as comp_en, c.competition_date,
+              cat.name_bn as cat_bn, cat.name_en as cat_en
+       FROM registrations r
+       JOIN competitions c ON c.id = r.competition_id
+       JOIN competition_categories cat ON cat.id = r.category_id
+       WHERE UPPER(r.registration_id) = ? AND r.qr_token = ?`
+    )
+    .get(regId, token) as Record<string, unknown> | undefined;
+
+  if (!reg) {
+    res.status(404).json({ error: 'Entry Pass not found or token mismatch.' });
+    return;
+  }
+
+  if (reg.payment_status !== 'PAID' || reg.qr_revoked === 1 || reg.status === 'rejected') {
+    res.status(403).json({
+      error:
+        reg.qr_revoked === 1
+          ? 'This Entry Pass has been revoked by HCFB Administration.'
+          : 'Entry Pass PDF is issued only after verified payment.',
+    });
+    return;
+  }
+
+  const origin = resolveAppOrigin(req);
+  const verifyUrl = `${origin}/verify/${encodeURIComponent(token)}`;
+  const pdfBuf = await generateEntryPassPdfBuffer({
+    registrationId: String(reg.registration_id),
+    participantNameEn: String(reg.name_en || reg.name_bn),
+    participantNameBn: String(reg.name_bn || ''),
+    institutionName: String(reg.school_name || ''),
+    classLevel: String(reg.class_level || ''),
+    competitionTitleEn: String(reg.comp_en || reg.comp_bn),
+    competitionDate: String(reg.competition_date || ''),
+    categoryNameEn: String(reg.cat_en || reg.cat_bn),
+    transactionId: String(reg.transaction_id || 'N/A'),
+    paymentMethod: String(reg.payment_method || 'bkash'),
+    paymentStatus: String(reg.payment_status),
+    paymentAmount: Number(reg.payment_amount || 0),
+    isTestPayment: reg.is_test_payment === 1,
+    registeredAt: String(reg.created_at || new Date().toISOString()),
+    qrToken: token,
+    verifyUrl,
+  });
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="HCFB-Entry-Pass-${reg.registration_id}.pdf"`);
+  res.send(pdfBuf);
+});
+
+// Anti-Fraud Real-Time QR Entry Pass Verification (Rate-limited, minimum public data exposure)
+function evaluateEntryPassRecord(row: Record<string, unknown> | undefined): {
+  result_status: 'AUTHENTIC' | 'INVALID' | 'REVOKED' | 'PENDING';
+  headline: string;
+  headline_bn: string;
+} {
+  if (!row) {
+    return {
+      result_status: 'INVALID',
+      headline: 'INVALID ENTRY PASS',
+      headline_bn: 'অবৈধ বা ভুয়া এন্ট্রি পাস',
+    };
+  }
+  if (row.qr_revoked === 1 || row.status === 'rejected') {
+    return {
+      result_status: 'REVOKED',
+      headline: 'INVALID ENTRY PASS',
+      headline_bn: 'এন্ট্রি পাস বাতিল (REVOKED) করা হয়েছে',
+    };
+  }
+  if (row.payment_status !== 'PAID') {
+    return {
+      result_status: 'PENDING',
+      headline: 'PAYMENT OR REGISTRATION PENDING',
+      headline_bn: 'পেমেন্ট বা নিবন্ধন যাচাইকরণ অপেক্ষমাণ',
+    };
+  }
+  return {
+    result_status: 'AUTHENTIC',
+    headline: 'AUTHENTIC ENTRY PASS',
+    headline_bn: 'বৈধ ও যাচাইকৃত এন্ট্রি পাস',
+  };
+}
+
+app.get('/api/public/verify-pass/:token', async (req, res) => {
+  const token = String(req.params.token || '').trim();
+  const ip = hashIp(req.ip || '');
+  if (!checkRateLimit(`qrverify:${ip}`, 45, 60_000)) {
+    res.status(429).json({ error: 'Too many verification requests. Please try again in a minute.' });
+    return;
+  }
+
+  if (!token || token.length < 8) {
+    res.status(400).json({ error: 'Invalid verification token format.' });
+    return;
+  }
+
+  const row = db
+    .prepare(
+      `SELECT r.id, r.registration_id, r.name_bn, r.name_en, r.school_name, r.class_level,
+              r.status, r.payment_status, r.payment_method, r.is_test_payment, r.qr_revoked, r.qr_revoked_reason,
+              c.title_bn as competition_title_bn, c.title_en as competition_title_en, c.competition_date,
+              cat.name_bn as category_name_bn, cat.name_en as category_name_en
+       FROM registrations r
+       JOIN competitions c ON c.id = r.competition_id
+       JOIN competition_categories cat ON cat.id = r.category_id
+       WHERE r.qr_token = ?`
+    )
+    .get(token) as Record<string, unknown> | undefined;
+
+  const evalRes = evaluateEntryPassRecord(row);
+
+  db.prepare(
+    `INSERT INTO qr_verification_logs (
+      qr_token, registration_pk, registration_id, result_status, scanner_type, ip_hash, user_agent
+    ) VALUES (?, ?, ?, ?, 'public_web', ?, ?)`
+  ).run(
+    token.slice(0, 64),
+    row ? Number(row.id) : null,
+    row ? String(row.registration_id) : '',
+    evalRes.result_status,
+    ip,
+    String(req.headers['user-agent'] || '').slice(0, 180)
+  );
+
+  // Only expose minimum non-sensitive public details needed to verify authenticity
+  res.status(row ? 200 : 404).json({
+    organization: 'HANDWRITING & CALLIGRAPHY FOUNDATION OF BANGLADESH',
+    result_status: evalRes.result_status,
+    headline: evalRes.headline,
+    headline_bn: evalRes.headline_bn,
+    verified_at: new Date().toISOString(),
+    pass: row
+      ? {
+          registration_id: row.registration_id,
+          participant_name_en: row.name_en,
+          participant_name_bn: row.name_bn,
+          institution_name: row.school_name,
+          class_level: row.class_level,
+          competition_title_en: row.competition_title_en,
+          competition_title_bn: row.competition_title_bn,
+          competition_year: String(row.competition_date || '2026').slice(0, 4) || '2026',
+          category_name_en: row.category_name_en,
+          category_name_bn: row.category_name_bn,
+          registration_status: row.status,
+          payment_status: row.payment_status,
+          is_test_payment: row.is_test_payment === 1,
+          revoked: row.qr_revoked === 1,
+          revoked_reason: row.qr_revoked === 1 ? row.qr_revoked_reason : '',
+        }
+      : null,
+  });
+});
+
+// ==================== PUBLIC LEGACY REGISTRATION & TRACKING ====================
 
 app.post('/api/public/registrations', (req, res) => {
   const body = req.body as Record<string, unknown>;
@@ -463,7 +1457,6 @@ app.post('/api/public/registrations', (req, res) => {
   const mobile = normalizeBdMobile(rawMobile);
   const alt_mobile = rawAltMobile ? normalizeBdMobile(rawAltMobile) : '';
 
-  // Check competition & category existence and status
   const comp = db.prepare('SELECT * FROM competitions WHERE id = ?').get(competition_id) as
     | { id: number; title_bn: string; title_en: string; status: string; registration_deadline: string }
     | undefined;
@@ -479,7 +1472,6 @@ app.post('/api/public/registrations', (req, res) => {
     return;
   }
 
-  // Duplicate check: same mobile + same competition + same lowercase English name
   const existing = db
     .prepare(
       `SELECT registration_id FROM registrations
@@ -494,7 +1486,6 @@ app.post('/api/public/registrations', (req, res) => {
     return;
   }
 
-  // Atomic transaction for sequential Registration ID generation
   const createTx = db.transaction(() => {
     const year = new Date().getFullYear();
     const prefix = `HCFB-${year}-`;
@@ -514,6 +1505,7 @@ app.post('/api/public/registrations', (req, res) => {
     }
     const registration_id = `${prefix}${String(nextSeq).padStart(5, '0')}`;
     const emailDispatchStatus = email ? 'queued_local_log' : 'not_provided';
+    const qrToken = generateQrToken();
 
     const info = db
       .prepare(
@@ -521,8 +1513,8 @@ app.post('/api/public/registrations', (req, res) => {
           registration_id, competition_id, category_id, name_bn, name_en,
           father_name, mother_name, school_name, class_level, mobile, alt_mobile, email,
           district, upazila, participant_type, additional_info,
-          guardian_consent, privacy_consent, status, email_dispatch_status, is_sample
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0)`
+          guardian_consent, privacy_consent, status, email_dispatch_status, qr_token, qr_issued_at, is_sample
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, datetime('now'), 0)`
       )
       .run(
         registration_id,
@@ -543,7 +1535,8 @@ app.post('/api/public/registrations', (req, res) => {
         additional_info,
         guardian_consent ? 1 : 0,
         privacy_consent ? 1 : 0,
-        emailDispatchStatus
+        emailDispatchStatus,
+        qrToken
       );
 
     return {
@@ -577,6 +1570,7 @@ app.get('/api/public/track/:regId', (req, res) => {
   const row = db
     .prepare(
       `SELECT r.registration_id, r.name_bn, r.name_en, r.school_name, r.district, r.status,
+              r.payment_status, r.payment_method, r.qr_token, r.qr_revoked,
               r.award_tier, r.rank_position, r.created_at, r.is_sample,
               c.title_bn as competition_title_bn, c.title_en as competition_title_en, c.results_published,
               cat.name_bn as category_name_bn, cat.name_en as category_name_en,
@@ -613,9 +1607,7 @@ app.get('/api/public/verify-certificate', async (req, res) => {
     return;
   }
 
-  const origin = process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL'
-    ? process.env.APP_URL
-    : `${req.protocol}://${req.get('host')}`;
+  const origin = resolveAppOrigin(req);
   const verifyUrl = `${origin}/verify?code=${encodeURIComponent(String(cert.certificate_code))}`;
   const qrDataUrl = await QRCode.toDataURL(verifyUrl, {
     width: 180,
@@ -701,16 +1693,26 @@ app.get('/api/participant/me', requireAuth(['participant']), async (req: AuthedR
     .prepare('SELECT * FROM certificates WHERE registration_pk = ? AND revoked = 0')
     .get(regPk) as Record<string, unknown> | undefined;
 
+  const origin = resolveAppOrigin(req);
   let qrDataUrl = '';
   if (cert) {
-    const origin = process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL'
-      ? process.env.APP_URL
-      : `${req.protocol}://${req.get('host')}`;
     const verifyUrl = `${origin}/verify?code=${encodeURIComponent(String(cert.certificate_code))}`;
     qrDataUrl = await QRCode.toDataURL(verifyUrl, {
       width: 160,
       margin: 1,
       color: { dark: '#0F2342', light: '#FFFFFF' },
+    });
+  }
+
+  let entryPassQrDataUrl = '';
+  let entryPassVerifyUrl = '';
+  if (reg.qr_token) {
+    entryPassVerifyUrl = `${origin}/verify/${encodeURIComponent(String(reg.qr_token))}`;
+    entryPassQrDataUrl = await QRCode.toDataURL(entryPassVerifyUrl, {
+      width: 220,
+      margin: 1,
+      errorCorrectionLevel: 'H',
+      color: { dark: '#04241D', light: '#FFFFFF' },
     });
   }
 
@@ -721,7 +1723,14 @@ app.get('/api/participant/me', requireAuth(['participant']), async (req: AuthedR
           .all(regPk)
       : [];
 
-  res.json({ registration: reg, certificate: cert || null, qrDataUrl, evaluations });
+  res.json({
+    registration: reg,
+    certificate: cert || null,
+    qrDataUrl,
+    entryPassQrDataUrl,
+    entryPassVerifyUrl,
+    evaluations,
+  });
 });
 
 app.patch('/api/participant/me', requireAuth(['participant']), (req: AuthedRequest, res) => {
@@ -934,6 +1943,14 @@ app.get('/api/admin/overview', requireAuth(ADMIN_ROLES), (_req, res) => {
   const unreadMessages = (
     db.prepare("SELECT COUNT(*) as c FROM contact_messages WHERE status = 'unread'").get() as { c: number }
   ).c;
+  const paymentSummary = db
+    .prepare(
+      `SELECT SUM(CASE WHEN payment_status = 'PAID' THEN 1 ELSE 0 END) as paid_count,
+              SUM(CASE WHEN payment_status != 'PAID' THEN 1 ELSE 0 END) as pending_count,
+              COALESCE(SUM(CASE WHEN payment_status = 'PAID' THEN payment_amount ELSE 0 END), 0) as total_fees
+       FROM registrations`
+    )
+    .get() as { paid_count: number | null; pending_count: number | null; total_fees: number | null };
 
   const recentRegistrations = db
     .prepare(
@@ -972,6 +1989,9 @@ app.get('/api/admin/overview', requireAuth(ADMIN_ROLES), (_req, res) => {
       publishedNotices,
       totalCertificates,
       unreadMessages,
+      paidRegistrations: Number(paymentSummary?.paid_count || 0),
+      pendingPayments: Number(paymentSummary?.pending_count || 0),
+      totalCollectedFees: Number(paymentSummary?.total_fees || 0),
     },
     recentRegistrations,
     districtAnalytics,
@@ -1006,7 +2026,176 @@ app.get('/api/admin/reports/competitions', requireAuth(ADMIN_ROLES), (_req, res)
   res.send(Buffer.from('\uFEFF' + lines.join('\r\n'), 'utf8'));
 });
 
-// Registrations CRUD & Export
+// ==================== ORGANIZER COMPETITION-DAY SCANNER & ATTENDANCE ====================
+
+app.post('/api/organizer/scan-verify', requireAuth(STAFF_ROLES), (req: AuthedRequest, res) => {
+  const rawInput = String((req.body as { qr_input?: string }).qr_input || '').trim();
+  if (!rawInput) {
+    res.status(400).json({ error: 'QR token or URL is required.' });
+    return;
+  }
+
+  let token = rawInput;
+  const match = rawInput.match(/\/verify\/([A-Za-z0-9_-]+)/);
+  if (match) {
+    token = match[1];
+  } else if (rawInput.includes('token=')) {
+    const qMatch = rawInput.match(/token=([A-Za-z0-9_-]+)/);
+    if (qMatch) token = qMatch[1];
+  }
+
+  const row = db
+    .prepare(
+      `SELECT r.*, c.title_bn as competition_title_bn, c.title_en as competition_title_en, c.competition_date,
+              cat.name_bn as category_name_bn, cat.name_en as category_name_en,
+              att.id as attendance_id, att.marked_at as attendance_marked_at, att.marked_by_name as attendance_marked_by
+       FROM registrations r
+       JOIN competitions c ON c.id = r.competition_id
+       JOIN competition_categories cat ON cat.id = r.category_id
+       LEFT JOIN competition_attendance att ON att.registration_pk = r.id AND att.competition_id = r.competition_id
+       WHERE r.qr_token = ? OR UPPER(r.registration_id) = UPPER(?)`
+    )
+    .get(token, token) as Record<string, unknown> | undefined;
+
+  const evalRes = evaluateEntryPassRecord(row);
+
+  db.prepare(
+    `INSERT INTO qr_verification_logs (
+      qr_token, registration_pk, registration_id, result_status, scanner_type, scanned_by, ip_hash, user_agent
+    ) VALUES (?, ?, ?, ?, 'organizer_scanner', ?, ?, ?)`
+  ).run(
+    token.slice(0, 64),
+    row ? Number(row.id) : null,
+    row ? String(row.registration_id) : '',
+    evalRes.result_status,
+    req.user!.email || req.user!.name || req.user!.sub,
+    hashIp(req.ip || ''),
+    String(req.headers['user-agent'] || '').slice(0, 180)
+  );
+
+  res.json({
+    result_status: evalRes.result_status,
+    headline: evalRes.headline,
+    headline_bn: evalRes.headline_bn,
+    pass: row
+      ? {
+          id: row.id,
+          registration_id: row.registration_id,
+          competition_id: row.competition_id,
+          name_en: row.name_en,
+          name_bn: row.name_bn,
+          school_name: row.school_name,
+          class_level: row.class_level,
+          district: row.district,
+          competition_title_en: row.competition_title_en,
+          competition_title_bn: row.competition_title_bn,
+          competition_year: String(row.competition_date || '2026').slice(0, 4) || '2026',
+          category_name_en: row.category_name_en,
+          category_name_bn: row.category_name_bn,
+          status: row.status,
+          payment_status: row.payment_status,
+          payment_method: row.payment_method,
+          transaction_id: row.transaction_id,
+          is_test_payment: row.is_test_payment === 1,
+          qr_revoked: row.qr_revoked === 1,
+          qr_revoked_reason: row.qr_revoked_reason,
+          attendance_marked: Boolean(row.attendance_id),
+          attendance_marked_at: row.attendance_marked_at || null,
+          attendance_marked_by: row.attendance_marked_by || null,
+        }
+      : null,
+  });
+});
+
+app.post('/api/organizer/attendance', requireAuth(STAFF_ROLES), (req: AuthedRequest, res) => {
+  const { registration_pk, notes } = req.body as { registration_pk?: number; notes?: string };
+  if (!registration_pk) {
+    res.status(400).json({ error: 'registration_pk is required.' });
+    return;
+  }
+
+  const reg = db
+    .prepare(
+      `SELECT r.*, c.competition_date
+       FROM registrations r
+       JOIN competitions c ON c.id = r.competition_id
+       WHERE r.id = ?`
+    )
+    .get(Number(registration_pk)) as Record<string, unknown> | undefined;
+
+  if (!reg) {
+    res.status(404).json({ error: 'Registration record not found.' });
+    return;
+  }
+
+  const evalRes = evaluateEntryPassRecord(reg);
+  if (evalRes.result_status !== 'AUTHENTIC') {
+    res.status(403).json({
+      error: `Cannot record attendance: Entry pass status is ${evalRes.result_status} (${evalRes.headline}).`,
+    });
+    return;
+  }
+
+  const existing = db
+    .prepare('SELECT * FROM competition_attendance WHERE registration_pk = ? AND competition_id = ?')
+    .get(Number(reg.id), Number(reg.competition_id)) as Record<string, unknown> | undefined;
+
+  if (existing) {
+    res.status(409).json({
+      error: `Attendance already recorded for ${reg.registration_id} at ${existing.marked_at}.`,
+      attendance: existing,
+    });
+    return;
+  }
+
+  const edition = String(reg.competition_date || '2026').slice(0, 4) || '2026';
+  db.prepare(
+    `INSERT INTO competition_attendance (
+      registration_pk, registration_id, competition_id, competition_edition, marked_by_id, marked_by_name, notes
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    Number(reg.id),
+    String(reg.registration_id),
+    Number(reg.competition_id),
+    edition,
+    Number(req.user!.sub),
+    req.user!.name || req.user!.email || 'Organizer',
+    String(notes || '').trim()
+  );
+
+  logAudit({
+    actorId: req.user!.sub,
+    actorEmail: req.user!.email,
+    actorRole: req.user!.role,
+    action: 'MARK_ATTENDANCE',
+    targetType: 'registration',
+    targetId: String(reg.registration_id),
+    details: `Edition ${edition}`,
+  });
+
+  const saved = db
+    .prepare('SELECT * FROM competition_attendance WHERE registration_pk = ? AND competition_id = ?')
+    .get(Number(reg.id), Number(reg.competition_id));
+
+  res.status(201).json({ success: true, attendance: saved });
+});
+
+app.get('/api/organizer/attendance', requireAuth(STAFF_ROLES), (_req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT att.*, r.name_en, r.name_bn, r.school_name, cat.name_en as category_name_en, c.title_en as competition_title_en
+       FROM competition_attendance att
+       JOIN registrations r ON r.id = att.registration_pk
+       JOIN competitions c ON c.id = att.competition_id
+       JOIN competition_categories cat ON cat.id = r.category_id
+       ORDER BY att.marked_at DESC LIMIT 100`
+    )
+    .all();
+  res.json({ attendance: rows });
+});
+
+// ==================== ADMIN REGISTRATIONS, PAYMENTS & QR MANAGEMENT ====================
+
 app.get('/api/admin/registrations', requireAuth(ADMIN_ROLES), (req, res) => {
   const page = Math.max(1, Number(req.query.page || 1));
   const limit = Math.min(100, Math.max(10, Number(req.query.limit || 20)));
@@ -1017,16 +2206,17 @@ app.get('/api/admin/registrations', requireAuth(ADMIN_ROLES), (req, res) => {
   const district = String(req.query.district || '').trim();
   const classLevel = String(req.query.class_level || '').trim();
   const status = String(req.query.status || '').trim();
+  const paymentStatus = String(req.query.payment_status || '').trim().toUpperCase();
 
   const clauses: string[] = [];
   const params: unknown[] = [];
 
   if (q) {
     clauses.push(
-      '(LOWER(r.name_bn) LIKE ? OR LOWER(r.name_en) LIKE ? OR LOWER(r.registration_id) LIKE ? OR r.mobile LIKE ?)'
+      '(LOWER(r.name_bn) LIKE ? OR LOWER(r.name_en) LIKE ? OR LOWER(r.registration_id) LIKE ? OR r.mobile LIKE ? OR LOWER(r.transaction_id) LIKE ?)'
     );
     const pat = `%${q}%`;
-    params.push(pat, pat, pat, pat);
+    params.push(pat, pat, pat, pat, pat);
   }
   if (competitionId) {
     clauses.push('r.competition_id = ?');
@@ -1048,28 +2238,143 @@ app.get('/api/admin/registrations', requireAuth(ADMIN_ROLES), (req, res) => {
     clauses.push('r.status = ?');
     params.push(status);
   }
+  if (paymentStatus) {
+    clauses.push('UPPER(r.payment_status) = ?');
+    params.push(paymentStatus);
+  }
 
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
   const total = (
     db.prepare(`SELECT COUNT(*) as c FROM registrations r ${where}`).get(...params) as { c: number }
   ).c;
 
+  const summary = db
+    .prepare(
+      `SELECT COUNT(*) as total_count,
+              SUM(CASE WHEN r.payment_status = 'PAID' THEN 1 ELSE 0 END) as paid_count,
+              SUM(CASE WHEN r.payment_status != 'PAID' THEN 1 ELSE 0 END) as pending_payment_count,
+              COALESCE(SUM(CASE WHEN r.payment_status = 'PAID' THEN r.payment_amount ELSE 0 END), 0) as total_collected_fees
+       FROM registrations r`
+    )
+    .get() as Record<string, number>;
+
   const rows = db
     .prepare(
       `SELECT r.*, c.title_bn as competition_title_bn, c.title_en as competition_title_en,
               cat.name_bn as category_name_bn, cat.name_en as category_name_en,
-              cert.certificate_code
+              cert.certificate_code,
+              att.marked_at as attendance_marked_at
        FROM registrations r
        JOIN competitions c ON c.id = r.competition_id
        JOIN competition_categories cat ON cat.id = r.category_id
        LEFT JOIN certificates cert ON cert.registration_pk = r.id AND cert.revoked = 0
+       LEFT JOIN competition_attendance att ON att.registration_pk = r.id AND att.competition_id = r.competition_id
        ${where}
        ORDER BY r.created_at DESC
        LIMIT ? OFFSET ?`
     )
     .all(...params, limit, offset);
 
-  res.json({ registrations: rows, total, page, totalPages: Math.max(1, Math.ceil(total / limit)) });
+  res.json({ registrations: rows, total, page, totalPages: Math.max(1, Math.ceil(total / limit)), summary });
+});
+
+app.get('/api/admin/qr-passes', requireAuth(ADMIN_ROLES), (req, res) => {
+  const q = String(req.query.q || '').trim().toLowerCase();
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+
+  if (q) {
+    clauses.push(
+      '(LOWER(r.registration_id) LIKE ? OR LOWER(r.name_en) LIKE ? OR LOWER(r.name_bn) LIKE ? OR LOWER(r.transaction_id) LIKE ?)'
+    );
+    const pat = `%${q}%`;
+    params.push(pat, pat, pat, pat);
+  }
+
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  const passes = db
+    .prepare(
+      `SELECT r.id, r.registration_id, r.name_en, r.name_bn, r.school_name, r.class_level, r.district,
+              r.status, r.payment_status, r.payment_method, r.payment_amount, r.transaction_id,
+              r.is_test_payment, r.qr_token, r.qr_revoked, r.qr_revoked_reason, r.qr_issued_at,
+              c.title_en as competition_title_en, c.title_bn as competition_title_bn,
+              cat.name_en as category_name_en,
+              att.marked_at as attendance_marked_at, att.marked_by_name as attendance_marked_by,
+              (SELECT COUNT(*) FROM qr_verification_logs l WHERE l.registration_pk = r.id) as scan_count,
+              (SELECT MAX(l.scanned_at) FROM qr_verification_logs l WHERE l.registration_pk = r.id) as last_scanned_at
+       FROM registrations r
+       JOIN competitions c ON c.id = r.competition_id
+       JOIN competition_categories cat ON cat.id = r.category_id
+       LEFT JOIN competition_attendance att ON att.registration_pk = r.id AND att.competition_id = r.competition_id
+       ${where}
+       ORDER BY r.created_at DESC LIMIT 120`
+    )
+    .all(...params);
+
+  const logs = db
+    .prepare(
+      `SELECT l.*, r.name_en as participant_name_en
+       FROM qr_verification_logs l
+       LEFT JOIN registrations r ON r.id = l.registration_pk
+       ORDER BY l.scanned_at DESC LIMIT 80`
+    )
+    .all();
+
+  const attendance = db
+    .prepare(
+      `SELECT att.*, r.name_en, r.name_bn, r.school_name, cat.name_en as category_name_en
+       FROM competition_attendance att
+       JOIN registrations r ON r.id = att.registration_pk
+       JOIN competition_categories cat ON cat.id = r.category_id
+       ORDER BY att.marked_at DESC LIMIT 80`
+    )
+    .all();
+
+  res.json({ passes, logs, attendance });
+});
+
+app.patch('/api/admin/qr-passes/:id/revoke', requireAuth(['super_admin', 'registration_manager']), (req: AuthedRequest, res) => {
+  const id = Number(req.params.id);
+  const { revoked, reason } = req.body as { revoked: boolean; reason?: string };
+
+  db.prepare(
+    `UPDATE registrations
+     SET qr_revoked = ?, qr_revoked_reason = ?, updated_at = datetime('now')
+     WHERE id = ?`
+  ).run(revoked ? 1 : 0, revoked ? String(reason || 'Revoked by HCFB Admin').trim() : '', id);
+
+  logAudit({
+    actorId: req.user!.sub,
+    actorEmail: req.user!.email,
+    actorRole: req.user!.role,
+    action: revoked ? 'REVOKE_ENTRY_PASS' : 'REACTIVATE_ENTRY_PASS',
+    targetType: 'registration',
+    targetId: String(id),
+    details: revoked ? String(reason || 'Revoked by admin') : 'Reactivated by admin',
+  });
+
+  res.json({ success: true });
+});
+
+app.post('/api/admin/qr-passes/:id/issue', requireAuth(['super_admin', 'registration_manager']), (req: AuthedRequest, res) => {
+  const id = Number(req.params.id);
+  const newToken = generateQrToken();
+  db.prepare(
+    `UPDATE registrations
+     SET qr_token = ?, qr_revoked = 0, qr_revoked_reason = '', qr_issued_at = datetime('now'), updated_at = datetime('now')
+     WHERE id = ?`
+  ).run(newToken, id);
+
+  logAudit({
+    actorId: req.user!.sub,
+    actorEmail: req.user!.email,
+    actorRole: req.user!.role,
+    action: 'ISSUE_ENTRY_PASS_QR',
+    targetType: 'registration',
+    targetId: String(id),
+  });
+
+  res.json({ success: true, qr_token: newToken });
 });
 
 app.patch('/api/admin/registrations/:id', requireAuth(['super_admin', 'registration_manager']), (req: AuthedRequest, res) => {
@@ -1132,9 +2437,10 @@ app.get('/api/admin/registrations/export/csv', requireAuth(ADMIN_ROLES), (req: A
   const rows = db
     .prepare(
       `SELECT r.registration_id, r.name_bn, r.name_en, r.father_name, r.mother_name,
-              r.school_name, r.class_level, r.mobile, r.alt_mobile, r.email,
-              r.district, r.upazila, r.participant_type, r.status, r.award_tier,
-              r.total_score, r.rank_position, r.created_at,
+              r.date_of_birth, r.gender, r.school_name, r.class_level, r.mobile, r.alt_mobile, r.email,
+              r.full_address, r.district, r.upazila, r.participant_type, r.status,
+              r.payment_method, r.payment_status, r.payment_amount, r.transaction_id, r.is_test_payment,
+              r.otp_verified, r.qr_revoked, r.award_tier, r.total_score, r.rank_position, r.created_at,
               c.title_en as competition, cat.name_en as category
        FROM registrations r
        JOIN competitions c ON c.id = r.competition_id
@@ -1149,17 +2455,27 @@ app.get('/api/admin/registrations/export/csv', requireAuth(ADMIN_ROLES), (req: A
     'Name (EN)',
     'Father Name',
     'Mother Name',
+    'Date of Birth',
+    'Gender',
     'School/Institution',
     'Class/Level',
     'Mobile',
     'Alt Mobile',
     'Email',
+    'Full Address',
     'District',
     'Upazila',
     'Type',
     'Competition',
     'Category',
-    'Status',
+    'Registration Status',
+    'Payment Method',
+    'Payment Status',
+    'Fee (BDT)',
+    'Transaction ID',
+    'Payment Mode',
+    'OTP Verified',
+    'Entry Pass QR Status',
     'Award Tier',
     'Score',
     'Rank',
@@ -1176,17 +2492,27 @@ app.get('/api/admin/registrations/export/csv', requireAuth(ADMIN_ROLES), (req: A
         r.name_en,
         r.father_name,
         r.mother_name,
+        r.date_of_birth,
+        r.gender,
         r.school_name,
         r.class_level,
         r.mobile,
         r.alt_mobile,
         r.email,
+        r.full_address,
         r.district,
         r.upazila,
         r.participant_type,
         r.competition,
         r.category,
         r.status,
+        r.payment_method,
+        r.payment_status,
+        r.payment_amount,
+        r.transaction_id,
+        r.is_test_payment ? 'SANDBOX' : 'LIVE',
+        r.otp_verified ? 'YES' : 'NO',
+        r.qr_revoked ? 'REVOKED' : r.payment_status === 'PAID' ? 'ACTIVE' : 'PENDING',
         r.award_tier,
         r.total_score,
         r.rank_position,
@@ -1246,10 +2572,10 @@ app.post('/api/admin/competitions', requireAuth(['super_admin', 'content_editor'
       .prepare(
         `INSERT INTO competitions (
           slug, title_bn, title_en, description_bn, description_en, banner_url,
-          registration_open_date, registration_deadline, competition_date,
+          registration_open_date, registration_deadline, competition_date, registration_fee,
           eligibility_bn, eligibility_en, rules_bn, rules_en,
           status, is_featured, results_published, is_sample
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
       )
       .run(
         slug,
@@ -1261,6 +2587,7 @@ app.post('/api/admin/competitions', requireAuth(['super_admin', 'content_editor'
         String(b.registration_open_date || ''),
         String(b.registration_deadline || ''),
         String(b.competition_date || ''),
+        Number(b.registration_fee ?? 200),
         String(b.eligibility_bn || ''),
         String(b.eligibility_en || ''),
         String(b.rules_bn || ''),
@@ -1341,6 +2668,7 @@ app.patch('/api/admin/competitions/:id', requireAuth(['super_admin', 'content_ed
          registration_open_date = COALESCE(?, registration_open_date),
          registration_deadline = COALESCE(?, registration_deadline),
          competition_date = COALESCE(?, competition_date),
+         registration_fee = COALESCE(?, registration_fee),
          eligibility_bn = COALESCE(?, eligibility_bn),
          eligibility_en = COALESCE(?, eligibility_en),
          rules_bn = COALESCE(?, rules_bn),
@@ -1360,6 +2688,7 @@ app.patch('/api/admin/competitions/:id', requireAuth(['super_admin', 'content_ed
       b.registration_open_date ?? null,
       b.registration_deadline ?? null,
       b.competition_date ?? null,
+      b.registration_fee !== undefined && b.registration_fee !== '' ? Number(b.registration_fee) : null,
       b.eligibility_bn ?? null,
       b.eligibility_en ?? null,
       b.rules_bn ?? null,

@@ -19,6 +19,7 @@ import {
 } from './pages/PublicContentPages';
 import { JudgePortalPage } from './pages/JudgePortalPage';
 import { AdminDashboardPage } from './pages/AdminDashboardPage';
+import { OrganizerScannerPage } from './pages/OrganizerScannerPage';
 
 function RouterView() {
   const { path } = useApp();
@@ -33,7 +34,14 @@ function RouterView() {
   }
   if (normalized === '/register') return <RegisterPage />;
   if (normalized === '/track') return <TrackRegistrationPage />;
+  if (normalized === '/scanner' || normalized === '/verify/scanner') {
+    return <OrganizerScannerPage />;
+  }
   if (normalized === '/verify') return <VerifyCertificatePage />;
+  if (normalized.startsWith('/verify/')) {
+    const token = decodeURIComponent(normalized.slice('/verify/'.length));
+    return <VerifyCertificatePage passToken={token} />;
+  }
   if (normalized === '/portal') return <ParticipantPortalPage />;
   if (normalized === '/hub') return <LearningHubPage />;
   if (normalized === '/gallery') return <GalleryPage />;

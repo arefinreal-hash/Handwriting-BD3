@@ -98,7 +98,8 @@ export function Layout({ children }: { children: React.ReactNode }) {
     { to: '/gallery', labelBn: 'গ্যালারি', labelEn: 'Gallery' },
     { to: '/notices', labelBn: 'নোটিশ বোর্ড', labelEn: 'Notices' },
     { to: '/track', labelBn: 'রেজিস্ট্রেশন ট্র্যাক', labelEn: 'Track Registration ID' },
-    { to: '/verify', labelBn: 'সনদ যাচাই (QR)', labelEn: 'Verify Certificate' },
+    { to: '/verify', labelBn: 'এন্ট্রি পাস ও সনদ যাচাই (QR)', labelEn: 'Verify Pass / Certificate' },
+    { to: '/scanner', labelBn: 'আয়োজক QR স্ক্যানার', labelEn: 'Organizer QR Scanner' },
     { to: '/team', labelBn: 'আমাদের টিম', labelEn: 'Our Team' },
     { to: '/contact', labelBn: 'যোগাযোগ', labelEn: 'Contact' },
   ];
@@ -372,7 +373,15 @@ export function Layout({ children }: { children: React.ReactNode }) {
                     className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-semibold text-white/80 hover:bg-white/10 cursor-pointer text-left"
                   >
                     <QrCode className="w-4 h-4 text-[#2DD4BF]" />
-                    <span>{t('সনদ যাচাই (QR)', 'Verify Certificate')}</span>
+                    <span>{t('এন্ট্রি পাস ও সনদ যাচাই (QR)', 'Verify Pass / Certificate')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => navigate('/scanner')}
+                    className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-semibold text-white/80 hover:bg-white/10 cursor-pointer text-left"
+                  >
+                    <QrCode className="w-4 h-4 text-[#E5C158]" />
+                    <span>{t('আয়োজক QR স্ক্যানার', 'Organizer QR Scanner')}</span>
                   </button>
                 </div>
               )}

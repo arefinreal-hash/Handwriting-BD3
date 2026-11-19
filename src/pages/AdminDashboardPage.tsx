@@ -23,10 +23,15 @@ import {
   RotateCcw,
   Save,
   X,
+  QrCode,
+  CreditCard,
+  Ban,
+  RefreshCw,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { HeroSection } from '../components/HeroSection';
 import { SiteFooter } from '../components/SiteFooter';
+import { PaymentMethodLogo } from '../components/PaymentLogos';
 import {
   BANGLADESH_DISTRICTS,
   AWARD_LABELS,
@@ -40,6 +45,7 @@ type AdminTab =
   | 'overview'
   | 'registrations'
   | 'competitions'
+  | 'qr_passes'
   | 'certificates'
   | 'notices'
   | 'gallery_hub'
@@ -65,21 +71,37 @@ interface AdminRegistrationRow {
   name_en: string;
   father_name: string;
   mother_name: string;
+  date_of_birth?: string;
+  gender?: string;
   school_name: string;
   class_level: string;
   mobile: string;
   alt_mobile: string;
   email: string;
+  full_address?: string;
   district: string;
   upazila: string;
   participant_type: string;
   additional_info: string;
+  sample_file_url?: string;
   status: string;
+  payment_method?: string;
+  payment_status?: string;
+  payment_amount?: number;
+  transaction_id?: string;
+  is_test_payment?: number;
+  otp_verified?: number;
+  qr_token?: string;
+  qr_revoked?: number;
+  qr_revoked_reason?: string;
+  attendance_marked_at?: string;
   award_tier: string;
   total_score: number | null;
   rank_position: number | null;
   competition_title_bn: string;
+  competition_title_en?: string;
   category_name_bn: string;
+  category_name_en?: string;
   certificate_code?: string;
   created_at: string;
 }
@@ -108,15 +130,31 @@ export function AdminDashboardPage() {
   const [regPage, setRegPage] = useState(1);
   const [regTotalPages, setRegTotalPages] = useState(1);
   const [regTotal, setRegTotal] = useState(0);
+  const [regSummary, setRegSummary] = useState<{
+    total_count: number;
+    paid_count: number;
+    pending_payment_count: number;
+    total_collected_fees: number;
+  }>({ total_count: 0, paid_count: 0, pending_payment_count: 0, total_collected_fees: 0 });
   const [regSearch, setRegSearch] = useState('');
   const [regCompFilter, setRegCompFilter] = useState('');
+  const [regCatFilter, setRegCatFilter] = useState('');
   const [regDistrictFilter, setRegDistrictFilter] = useState('');
   const [regStatusFilter, setRegStatusFilter] = useState('');
+  const [regPaymentFilter, setRegPaymentFilter] = useState('');
+  const [viewingReg, setViewingReg] = useState<AdminRegistrationRow | null>(null);
   const [editingReg, setEditingReg] = useState<AdminRegistrationRow | null>(null);
   const [confirmDeleteReg, setConfirmDeleteReg] = useState<AdminRegistrationRow | null>(null);
 
+  // QR Verification & Attendance Management state
+  const [qrSearch, setQrSearch] = useState('');
+  const [qrPasses, setQrPasses] = useState<Array<Record<string, unknown>>>([]);
+  const [qrLogs, setQrLogs] = useState<Array<Record<string, unknown>>>([]);
+  const [qrAttendance, setQrAttendance] = useState<Array<Record<string, unknown>>>([]);
+
   // Competitions state
   const [adminComps, setAdminComps] = useState<Array<Record<string, unknown>>>([]);
+  const [compEdits, setCompEdits] = useState<Record<number, { registration_fee: string; registration_deadline: string }>>({});
   const [editingCriteriaComp, setEditingCriteriaComp] = useState<{
     id: number;
     title: string;
@@ -131,6 +169,7 @@ export function AdminDashboardPage() {
     registration_open_date: new Date().toISOString().slice(0, 10),
     registration_deadline: '2026-12-31',
     competition_date: '2027-01-20',
+    registration_fee: 200,
     eligibility_bn: '',
     eligibility_en: '',
     rules_bn: '',
@@ -278,8 +317,10 @@ export function AdminDashboardPage() {
       limit: '15',
       q: regSearch,
       competition_id: regCompFilter,
+      category_id: regCatFilter,
       district: regDistrictFilter,
       status: regStatusFilter,
+      payment_status: regPaymentFilter,
     });
     const res = await fetch(`/api/admin/registrations?${params.toString()}`, { headers: authHeaders() });
     if (res.ok) {
@@ -287,14 +328,49 @@ export function AdminDashboardPage() {
       setRegs(json.registrations || []);
       setRegTotalPages(json.totalPages || 1);
       setRegTotal(json.total || 0);
+      if (json.summary) setRegSummary(json.summary);
     }
-  }, [token, authHeaders, regPage, regSearch, regCompFilter, regDistrictFilter, regStatusFilter]);
+  }, [
+    token,
+    authHeaders,
+    regPage,
+    regSearch,
+    regCompFilter,
+    regCatFilter,
+    regDistrictFilter,
+    regStatusFilter,
+    regPaymentFilter,
+  ]);
 
   const loadCompetitions = useCallback(async () => {
     if (!token) return;
     const res = await fetch('/api/admin/competitions', { headers: authHeaders() });
-    if (res.ok) setAdminComps((await res.json()).competitions || []);
+    if (res.ok) {
+      const list = ((await res.json()).competitions || []) as Array<Record<string, unknown>>;
+      setAdminComps(list);
+      const editMap: Record<number, { registration_fee: string; registration_deadline: string }> = {};
+      for (const c of list) {
+        editMap[Number(c.id)] = {
+          registration_fee: String(c.registration_fee ?? 200),
+          registration_deadline: String(c.registration_deadline ?? '2026-11-30'),
+        };
+      }
+      setCompEdits(editMap);
+    }
   }, [token, authHeaders]);
+
+  const loadQrPasses = useCallback(async () => {
+    if (!token) return;
+    const res = await fetch(`/api/admin/qr-passes?q=${encodeURIComponent(qrSearch)}`, {
+      headers: authHeaders(),
+    });
+    if (res.ok) {
+      const json = await res.json();
+      setQrPasses(json.passes || []);
+      setQrLogs(json.logs || []);
+      setQrAttendance(json.attendance || []);
+    }
+  }, [token, authHeaders, qrSearch]);
 
   const loadCertificates = useCallback(async () => {
     if (!token) return;
@@ -336,6 +412,7 @@ export function AdminDashboardPage() {
       loadCompetitions();
     }
     if (tab === 'competitions') loadCompetitions();
+    if (tab === 'qr_passes') loadQrPasses();
     if (tab === 'certificates') {
       loadCertificates();
       loadCompetitions();
@@ -343,7 +420,18 @@ export function AdminDashboardPage() {
     if (tab === 'notices') loadNotices();
     if (tab === 'team_messages') loadMessages();
     if (tab === 'security') loadSecurity();
-  }, [tab, user, loadOverview, loadRegistrations, loadCompetitions, loadCertificates, loadNotices, loadMessages, loadSecurity]);
+  }, [
+    tab,
+    user,
+    loadOverview,
+    loadRegistrations,
+    loadCompetitions,
+    loadQrPasses,
+    loadCertificates,
+    loadNotices,
+    loadMessages,
+    loadSecurity,
+  ]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -448,7 +536,8 @@ export function AdminDashboardPage() {
 
   const navButtons: Array<{ id: AdminTab; label: string; icon: React.ElementType; roles: string[] }> = [
     { id: 'overview', label: 'Overview', icon: LayoutDashboard, roles: ['super_admin', 'content_editor', 'registration_manager'] },
-    { id: 'registrations', label: 'Registrations', icon: Users, roles: ['super_admin', 'registration_manager'] },
+    { id: 'registrations', label: 'Registrations & Payments', icon: Users, roles: ['super_admin', 'registration_manager'] },
+    { id: 'qr_passes', label: 'QR Code Verification Management', icon: QrCode, roles: ['super_admin', 'registration_manager'] },
     { id: 'competitions', label: 'Competitions', icon: Trophy, roles: ['super_admin', 'content_editor'] },
     { id: 'certificates', label: 'Certificates', icon: Award, roles: ['super_admin', 'registration_manager'] },
     { id: 'notices', label: 'Notices', icon: Bell, roles: ['super_admin', 'content_editor'] },
@@ -475,7 +564,15 @@ export function AdminDashboardPage() {
           </p>
           <h1 className="text-xl sm:text-2xl font-bold text-[#4C1D95]">HCFB Admin Control Center</h1>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <button
+            type="button"
+            onClick={() => navigate('/scanner')}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-[#059669] text-white rounded-lg text-xs font-semibold hover:bg-[#047857] cursor-pointer"
+          >
+            <QrCode className="w-3.5 h-3.5" />
+            <span>QR Scanner</span>
+          </button>
           <button
             type="button"
             onClick={() => navigate('/judge')}
@@ -523,13 +620,16 @@ export function AdminDashboardPage() {
       {/* TAB 1: OVERVIEW */}
       {tab === 'overview' && overview && (
         <div className="space-y-8">
-          <div className="grid grid-cols-2 lg:grid-cols-6 gap-4">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
             {[
               { label: 'Total Registrations', val: overview.metrics.totalRegistrations },
+              { label: 'Paid Entries (PAID)', val: overview.metrics.paidRegistrations ?? 0 },
+              { label: 'Pending Payments', val: overview.metrics.pendingPayments ?? 0 },
+              { label: 'Collected Fees (BDT)', val: `৳${overview.metrics.totalCollectedFees ?? 0}` },
+              { label: 'Issued Certificates', val: overview.metrics.totalCertificates },
               { label: 'Total Competitions', val: overview.metrics.totalCompetitions },
               { label: 'Active Contests', val: overview.metrics.activeCompetitions },
               { label: 'Published Notices', val: overview.metrics.publishedNotices },
-              { label: 'Issued Certificates', val: overview.metrics.totalCertificates },
               { label: 'Unread Messages', val: overview.metrics.unreadMessages },
             ].map((card) => (
               <div key={card.label} className="bg-white border border-[#4C1D95]/12 rounded-xl p-4 space-y-1">
@@ -612,9 +712,29 @@ export function AdminDashboardPage() {
         </div>
       )}
 
-      {/* TAB 2: REGISTRATIONS */}
+      {/* TAB 2: REGISTRATIONS & PAYMENTS */}
       {tab === 'registrations' && (
         <div className="space-y-5">
+          {/* Financial & Payment KPI Strip */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 no-print">
+            <div className="bg-white border border-[#4C1D95]/12 rounded-xl p-4">
+              <p className="text-[11px] font-semibold text-[#4C1D95]/65">Total Registrations</p>
+              <p className="text-2xl font-bold font-mono text-[#4C1D95]">{regSummary.total_count}</p>
+            </div>
+            <div className="bg-[#ECFDF5] border border-[#A7F3D0] rounded-xl p-4">
+              <p className="text-[11px] font-semibold text-[#065F46]">Successful Payments (PAID)</p>
+              <p className="text-2xl font-bold font-mono text-[#059669]">{regSummary.paid_count}</p>
+            </div>
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+              <p className="text-[11px] font-semibold text-amber-900">Pending / Unpaid</p>
+              <p className="text-2xl font-bold font-mono text-amber-700">{regSummary.pending_payment_count}</p>
+            </div>
+            <div className="bg-[#F5F3FF] border border-[#DDD6FE] rounded-xl p-4">
+              <p className="text-[11px] font-semibold text-[#4C1D95]">Total Collected Fees</p>
+              <p className="text-2xl font-bold font-mono text-[#4C1D95]">৳{regSummary.total_collected_fees}</p>
+            </div>
+          </div>
+
           <div className="bg-white border border-[#4C1D95]/12 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3 no-print">
             <div className="flex flex-wrap items-center gap-2 flex-1">
               <div className="relative">
@@ -626,14 +746,15 @@ export function AdminDashboardPage() {
                     setRegSearch(e.target.value);
                     setRegPage(1);
                   }}
-                  placeholder="Search Name / ID / Mobile..."
-                  className="pl-9 pr-3 py-2 rounded-lg border border-[#4C1D95]/20 text-xs w-56"
+                  placeholder="Name / Reg ID / Mobile / Txn ID..."
+                  className="pl-9 pr-3 py-2 rounded-lg border border-[#4C1D95]/20 text-xs w-60"
                 />
               </div>
               <select
                 value={regCompFilter}
                 onChange={(e) => {
                   setRegCompFilter(e.target.value);
+                  setRegCatFilter('');
                   setRegPage(1);
                 }}
                 className="px-3 py-2 rounded-lg border border-[#4C1D95]/20 text-xs"
@@ -644,6 +765,42 @@ export function AdminDashboardPage() {
                     {String(c.title_en || c.title_bn)}
                   </option>
                 ))}
+              </select>
+              <select
+                value={regCatFilter}
+                onChange={(e) => {
+                  setRegCatFilter(e.target.value);
+                  setRegPage(1);
+                }}
+                className="px-3 py-2 rounded-lg border border-[#4C1D95]/20 text-xs"
+              >
+                <option value="">All Categories</option>
+                {adminComps
+                  .filter((c) => !regCompFilter || String(c.id) === regCompFilter)
+                  .flatMap((c) =>
+                    Array.isArray(c.categories)
+                      ? (c.categories as Array<{ id: number; name_en: string; name_bn: string }>)
+                      : []
+                  )
+                  .map((cat) => (
+                    <option key={cat.id} value={String(cat.id)}>
+                      {cat.name_en || cat.name_bn}
+                    </option>
+                  ))}
+              </select>
+              <select
+                value={regPaymentFilter}
+                onChange={(e) => {
+                  setRegPaymentFilter(e.target.value);
+                  setRegPage(1);
+                }}
+                className="px-3 py-2 rounded-lg border border-[#4C1D95]/20 text-xs"
+              >
+                <option value="">All Payments</option>
+                <option value="PAID">PAID</option>
+                <option value="PENDING">PENDING</option>
+                <option value="FAILED">FAILED</option>
+                <option value="CANCELLED">CANCELLED</option>
               </select>
               <select
                 value={regDistrictFilter}
@@ -703,6 +860,7 @@ export function AdminDashboardPage() {
                     <th className="py-3 px-4">Participant</th>
                     <th className="py-3 px-4">Mobile &amp; District</th>
                     <th className="py-3 px-4">Competition / Category</th>
+                    <th className="py-3 px-4">Payment &amp; Txn</th>
                     <th className="py-3 px-4">Status / Award</th>
                     <th className="py-3 px-4 text-right no-print">Actions</th>
                   </tr>
@@ -710,18 +868,35 @@ export function AdminDashboardPage() {
                 <tbody className="divide-y divide-[#4C1D95]/10">
                   {regs.map((r) => (
                     <tr key={r.id}>
-                      <td className="py-3 px-4 font-mono font-bold text-[#7C3AED]">{r.registration_id}</td>
+                      <td className="py-3 px-4 font-mono font-bold text-[#7C3AED]">
+                        <p>{r.registration_id}</p>
+                        {r.qr_revoked === 1 && (
+                          <span className="text-[10px] text-rose-700 font-bold">QR REVOKED</span>
+                        )}
+                      </td>
                       <td className="py-3 px-4">
-                        <p className="font-bold text-[#4C1D95]">{r.name_bn}</p>
-                        <p className="text-[#4C1D95]/70">{r.name_en} · {r.school_name} ({r.class_level})</p>
+                        <p className="font-bold text-[#4C1D95]">{r.name_en || r.name_bn}</p>
+                        <p className="text-[#4C1D95]/70">{r.school_name} ({r.class_level})</p>
                       </td>
                       <td className="py-3 px-4 font-mono tabular-nums">
                         <p>{r.mobile}</p>
                         <p className="text-[#4C1D95]/65 font-sans">{r.district}</p>
                       </td>
                       <td className="py-3 px-4">
-                        <p className="font-medium">{r.competition_title_bn}</p>
-                        <p className="text-[#4C1D95]/65">{r.category_name_bn}</p>
+                        <p className="font-medium">{r.competition_title_en || r.competition_title_bn}</p>
+                        <p className="text-[#4C1D95]/65">{r.category_name_en || r.category_name_bn}</p>
+                      </td>
+                      <td className="py-3 px-4">
+                        <p
+                          className={`font-bold ${
+                            r.payment_status === 'PAID' ? 'text-emerald-700' : 'text-amber-700'
+                          }`}
+                        >
+                          {r.payment_status || 'PENDING'} · ৳{r.payment_amount ?? 0}
+                        </p>
+                        <p className="font-mono text-[11px] text-[#4C1D95]/70">
+                          {r.payment_method || '-'} {r.transaction_id ? `· ${r.transaction_id}` : ''}
+                        </p>
                       </td>
                       <td className="py-3 px-4">
                         <p className="font-semibold uppercase text-[#4C1D95]">{r.status}</p>
@@ -731,7 +906,15 @@ export function AdminDashboardPage() {
                           </p>
                         )}
                       </td>
-                      <td className="py-3 px-4 text-right space-x-2 whitespace-nowrap no-print">
+                      <td className="py-3 px-4 text-right space-x-1.5 whitespace-nowrap no-print">
+                        <button
+                          type="button"
+                          onClick={() => setViewingReg(r)}
+                          className="p-1.5 border border-[#4C1D95]/20 rounded hover:bg-[#F5F3FF] text-[#4C1D95] cursor-pointer"
+                          title="View Full Profile"
+                        >
+                          <Eye className="w-3.5 h-3.5 inline" />
+                        </button>
                         <button
                           type="button"
                           onClick={() => setEditingReg(r)}
@@ -797,93 +980,362 @@ export function AdminDashboardPage() {
         </div>
       )}
 
+      {/* TAB 2B: QR CODE VERIFICATION MANAGEMENT */}
+      {tab === 'qr_passes' && (
+        <div className="space-y-6">
+          <div className="bg-white border border-[#4C1D95]/12 rounded-xl p-5 flex flex-wrap items-center justify-between gap-4">
+            <div className="flex flex-wrap items-center gap-3 flex-1">
+              <div className="relative">
+                <Search className="w-4 h-4 text-[#4C1D95]/45 absolute left-3 top-2.5" />
+                <input
+                  type="search"
+                  value={qrSearch}
+                  onChange={(e) => setQrSearch(e.target.value)}
+                  placeholder="Filter by Reg ID / Name / Txn ID..."
+                  className="pl-9 pr-3 py-2 rounded-lg border border-[#4C1D95]/20 text-xs w-64"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={loadQrPasses}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 border border-[#4C1D95]/20 text-[#4C1D95] text-xs font-semibold rounded-lg hover:bg-[#F5F3FF] cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Refresh</span>
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => navigate('/scanner')}
+              className="inline-flex items-center gap-2 px-4 py-2 bg-[#059669] text-white text-xs font-bold rounded-lg hover:bg-[#047857] cursor-pointer"
+            >
+              <QrCode className="w-4 h-4" />
+              <span>Open Competition-Day QR Scanner</span>
+            </button>
+          </div>
+
+          <div className="bg-white border border-[#4C1D95]/12 rounded-xl overflow-hidden">
+            <div className="px-5 py-3 border-b border-[#4C1D95]/10 flex items-center justify-between">
+              <h2 className="text-sm font-bold text-[#4C1D95]">Issued Entry Passes &amp; QR Verification Control</h2>
+              <span className="text-xs text-[#4C1D95]/65 font-mono">{qrPasses.length} passes</span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-[#F5F3FF] text-[#4C1D95]/75">
+                  <tr>
+                    <th className="py-3 px-4">Reg ID</th>
+                    <th className="py-3 px-4">Participant</th>
+                    <th className="py-3 px-4">Payment</th>
+                    <th className="py-3 px-4">QR Pass Status</th>
+                    <th className="py-3 px-4">Scans &amp; Attendance</th>
+                    <th className="py-3 px-4 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#4C1D95]/10">
+                  {qrPasses.map((p) => {
+                    const id = Number(p.id);
+                    const revoked = p.qr_revoked === 1;
+                    const paid = p.payment_status === 'PAID';
+                    const qrTok = String(p.qr_token || '');
+                    return (
+                      <tr key={id}>
+                        <td className="py-3 px-4 font-mono font-bold text-[#7C3AED]">{String(p.registration_id)}</td>
+                        <td className="py-3 px-4">
+                          <p className="font-bold text-[#4C1D95]">{String(p.name_en || p.name_bn)}</p>
+                          <p className="text-[#4C1D95]/70">{String(p.category_name_en || '')} · {String(p.school_name || '')}</p>
+                        </td>
+                        <td className="py-3 px-4">
+                          <p className={`font-bold ${paid ? 'text-emerald-700' : 'text-amber-700'}`}>
+                            {String(p.payment_status || 'PENDING')}
+                            {p.is_test_payment === 1 ? ' (Sandbox)' : ''}
+                          </p>
+                          <p className="font-mono text-[11px] text-[#4C1D95]/65">{String(p.transaction_id || '-')}</p>
+                        </td>
+                        <td className="py-3 px-4">
+                          {revoked ? (
+                            <span className="font-bold text-rose-700">REVOKED</span>
+                          ) : paid && qrTok ? (
+                            <span className="font-bold text-emerald-700">ACTIVE / AUTHENTIC</span>
+                          ) : (
+                            <span className="font-bold text-amber-700">PENDING</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-4 font-mono">
+                          <p>Scans: {Number(p.scan_count || 0)}</p>
+                          <p className="text-[11px] text-[#4C1D95]/70">
+                            {p.attendance_marked_at ? `Checked in: ${String(p.attendance_marked_at).slice(0, 16)}` : 'Not checked in'}
+                          </p>
+                        </td>
+                        <td className="py-3 px-4 text-right space-x-1.5 whitespace-nowrap">
+                          {qrTok && (
+                            <button
+                              type="button"
+                              onClick={() => navigate(`/verify/${encodeURIComponent(qrTok)}`)}
+                              className="px-2.5 py-1 border border-[#4C1D95]/20 rounded text-[#4C1D95] font-semibold hover:bg-[#F5F3FF] cursor-pointer"
+                            >
+                              Verify Page
+                            </button>
+                          )}
+                          {paid && !revoked && qrTok && (
+                            <a
+                              href={`/api/public/registrations/${encodeURIComponent(
+                                String(p.registration_id)
+                              )}/entry-pass.pdf?token=${encodeURIComponent(qrTok)}`}
+                              className="px-2.5 py-1 bg-[#4C1D95] text-white rounded font-semibold inline-block"
+                            >
+                              PDF Pass
+                            </a>
+                          )}
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              await fetch(`/api/admin/qr-passes/${id}/revoke`, {
+                                method: 'PATCH',
+                                headers: authHeaders({ 'Content-Type': 'application/json' }),
+                                body: JSON.stringify({
+                                  revoked: !revoked,
+                                  reason: !revoked ? 'Revoked via QR Verification Management' : '',
+                                }),
+                              });
+                              showToast(revoked ? 'Entry Pass reactivated' : 'Entry Pass revoked');
+                              loadQrPasses();
+                            }}
+                            className={`px-2.5 py-1 rounded font-semibold cursor-pointer ${
+                              revoked
+                                ? 'bg-emerald-600 text-white'
+                                : 'border border-rose-300 text-rose-700 hover:bg-rose-50'
+                            }`}
+                          >
+                            {revoked ? 'Reactivate' : 'Revoke'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              await fetch(`/api/admin/qr-passes/${id}/issue`, {
+                                method: 'POST',
+                                headers: authHeaders(),
+                              });
+                              showToast('New cryptographic QR token issued');
+                              loadQrPasses();
+                            }}
+                            className="px-2.5 py-1 border border-[#7C3AED]/40 text-[#7C3AED] rounded font-semibold cursor-pointer"
+                          >
+                            Re-issue QR
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div className="bg-white border border-[#4C1D95]/12 rounded-xl p-5 space-y-3">
+              <h3 className="text-sm font-bold text-[#4C1D95]">Recent QR Scan History ({qrLogs.length})</h3>
+              <div className="max-h-64 overflow-y-auto divide-y divide-[#4C1D95]/10 text-xs">
+                {qrLogs.length === 0 ? (
+                  <p className="py-4 text-[#4C1D95]/60">No verification scans logged yet.</p>
+                ) : (
+                  qrLogs.map((l) => (
+                    <div key={String(l.id)} className="py-2 flex items-center justify-between gap-2">
+                      <div>
+                        <span
+                          className={`font-bold mr-2 ${
+                            l.result_status === 'AUTHENTIC'
+                              ? 'text-emerald-700'
+                              : l.result_status === 'PENDING'
+                                ? 'text-amber-700'
+                                : 'text-rose-700'
+                          }`}
+                        >
+                          {String(l.result_status)}
+                        </span>
+                        <span className="font-mono font-semibold text-[#4C1D95]">
+                          {String(l.registration_id || 'UNKNOWN')}
+                        </span>
+                        <span className="text-[#4C1D95]/65 ml-1.5">
+                          ({String(l.scanner_type)})
+                        </span>
+                      </div>
+                      <span className="font-mono text-[11px] text-[#4C1D95]/60">{String(l.scanned_at)}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div className="bg-white border border-[#4C1D95]/12 rounded-xl p-5 space-y-3">
+              <h3 className="text-sm font-bold text-[#4C1D95]">Venue Check-In Attendance ({qrAttendance.length})</h3>
+              <div className="max-h-64 overflow-y-auto divide-y divide-[#4C1D95]/10 text-xs">
+                {qrAttendance.length === 0 ? (
+                  <p className="py-4 text-[#4C1D95]/60">No attendance check-ins recorded yet.</p>
+                ) : (
+                  qrAttendance.map((a) => (
+                    <div key={String(a.id)} className="py-2 flex items-center justify-between gap-2">
+                      <div>
+                        <span className="font-mono font-bold text-[#059669] mr-2">{String(a.registration_id)}</span>
+                        <span className="font-semibold text-[#4C1D95]">{String(a.name_en || a.name_bn)}</span>
+                        <span className="text-[#4C1D95]/65 ml-1.5">· {String(a.marked_by_name || '')}</span>
+                      </div>
+                      <span className="font-mono text-[11px] text-[#4C1D95]/60">{String(a.marked_at)}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* TAB 3: COMPETITIONS */}
       {tab === 'competitions' && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="lg:col-span-7 space-y-4">
-            {adminComps.map((c) => (
-              <div key={String(c.id)} className="bg-white border border-[#4C1D95]/12 rounded-xl p-5 space-y-3">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <p className="text-xs font-mono text-[#7C3AED] uppercase font-semibold">
-                      {String(c.status)} · {String(c.participant_count ?? 0)} participants
-                    </p>
-                    <h3 className="text-base font-bold text-[#4C1D95]">{String(c.title_bn)}</h3>
-                    <p className="text-xs text-[#4C1D95]/70">{String(c.title_en)}</p>
+            {adminComps.map((c) => {
+              const cid = Number(c.id);
+              const editState = compEdits[cid] || {
+                registration_fee: String(c.registration_fee ?? 200),
+                registration_deadline: String(c.registration_deadline ?? '2026-11-30'),
+              };
+              return (
+                <div key={cid} className="bg-white border border-[#4C1D95]/12 rounded-xl p-5 space-y-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-mono text-[#7C3AED] uppercase font-semibold">
+                        {String(c.status)} · {String(c.participant_count ?? 0)} participants · Fee: ৳{String(c.registration_fee ?? 200)} BDT
+                      </p>
+                      <h3 className="text-base font-bold text-[#4C1D95]">{String(c.title_bn)}</h3>
+                      <p className="text-xs text-[#4C1D95]/70">{String(c.title_en)}</p>
+                    </div>
                   </div>
-                </div>
-                <div className="flex flex-wrap gap-2 pt-2 border-t border-[#4C1D95]/10">
-                  {(['published', 'closed', 'draft'] as const).map((st) => (
+
+                  {/* Fee & Deadline Quick Editor */}
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-2 border-t border-[#4C1D95]/10 items-end text-xs">
+                    <div>
+                      <label className="block text-[11px] font-semibold text-[#4C1D95]/70 mb-1">Registration Fee (BDT)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        value={editState.registration_fee}
+                        onChange={(e) =>
+                          setCompEdits((prev) => ({
+                            ...prev,
+                            [cid]: { ...editState, registration_fee: e.target.value },
+                          }))
+                        }
+                        className="w-full px-2.5 py-1.5 border border-[#4C1D95]/20 rounded-lg font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-semibold text-[#4C1D95]/70 mb-1">Registration Deadline</label>
+                      <input
+                        type="date"
+                        value={editState.registration_deadline}
+                        onChange={(e) =>
+                          setCompEdits((prev) => ({
+                            ...prev,
+                            [cid]: { ...editState, registration_deadline: e.target.value },
+                          }))
+                        }
+                        className="w-full px-2.5 py-1.5 border border-[#4C1D95]/20 rounded-lg"
+                      />
+                    </div>
                     <button
-                      key={st}
+                      type="button"
+                      onClick={async () => {
+                        await fetch(`/api/admin/competitions/${cid}`, {
+                          method: 'PATCH',
+                          headers: authHeaders({ 'Content-Type': 'application/json' }),
+                          body: JSON.stringify({
+                            registration_fee: Number(editState.registration_fee || 0),
+                            registration_deadline: editState.registration_deadline,
+                          }),
+                        });
+                        showToast('Competition fee & deadline saved');
+                        loadCompetitions();
+                        refreshBootstrap();
+                      }}
+                      className="px-3 py-1.5 bg-[#059669] text-white font-semibold rounded-lg hover:bg-[#047857] cursor-pointer"
+                    >
+                      Save Fee &amp; Deadline
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2 pt-2 border-t border-[#4C1D95]/10">
+                    {(['published', 'closed', 'draft'] as const).map((st) => (
+                      <button
+                        key={st}
+                        type="button"
+                        onClick={async () => {
+                          await fetch(`/api/admin/competitions/${c.id}`, {
+                            method: 'PATCH',
+                            headers: authHeaders({ 'Content-Type': 'application/json' }),
+                            body: JSON.stringify({ status: st }),
+                          });
+                          showToast(`Competition marked ${st}`);
+                          loadCompetitions();
+                          refreshBootstrap();
+                        }}
+                        className={`px-3 py-1 text-xs rounded border cursor-pointer ${
+                          c.status === st ? 'bg-[#4C1D95] text-white' : 'border-[#4C1D95]/20'
+                        }`}
+                      >
+                        Set {st}
+                      </button>
+                    ))}
+                    <button
                       type="button"
                       onClick={async () => {
                         await fetch(`/api/admin/competitions/${c.id}`, {
                           method: 'PATCH',
                           headers: authHeaders({ 'Content-Type': 'application/json' }),
-                          body: JSON.stringify({ status: st }),
+                          body: JSON.stringify({ is_featured: true }),
                         });
-                        showToast(`Competition marked ${st}`);
+                        showToast('Set as Featured Competition');
                         loadCompetitions();
                         refreshBootstrap();
                       }}
-                      className={`px-3 py-1 text-xs rounded border cursor-pointer ${
-                        c.status === st ? 'bg-[#4C1D95] text-white' : 'border-[#4C1D95]/20'
-                      }`}
+                      className="px-3 py-1 text-xs rounded border border-[#7C3AED] text-[#7C3AED] cursor-pointer"
                     >
-                      Set {st}
+                      {c.is_featured === 1 ? 'Featured Active' : 'Make Featured'}
                     </button>
-                  ))}
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      await fetch(`/api/admin/competitions/${c.id}`, {
-                        method: 'PATCH',
-                        headers: authHeaders({ 'Content-Type': 'application/json' }),
-                        body: JSON.stringify({ is_featured: true }),
-                      });
-                      showToast('Set as Featured Competition');
-                      loadCompetitions();
-                      refreshBootstrap();
-                    }}
-                    className="px-3 py-1 text-xs rounded border border-[#7C3AED] text-[#7C3AED] cursor-pointer"
-                  >
-                    {c.is_featured === 1 ? 'Featured Active' : 'Make Featured'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      await fetch(`/api/admin/competitions/${c.id}`, {
-                        method: 'PATCH',
-                        headers: authHeaders({ 'Content-Type': 'application/json' }),
-                        body: JSON.stringify({ results_published: c.results_published !== 1 }),
-                      });
-                      showToast('Toggled Results Publication');
-                      loadCompetitions();
-                      refreshBootstrap();
-                    }}
-                    className="px-3 py-1 text-xs rounded bg-[#7C3AED] text-white cursor-pointer"
-                  >
-                    {c.results_published === 1 ? 'Hide Results' : 'Publish Merit List'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setEditingCriteriaComp({
-                        id: Number(c.id),
-                        title: String(c.title_en || c.title_bn),
-                        criteria: Array.isArray(c.criteria) && c.criteria.length > 0
-                          ? (c.criteria as Array<{ name_bn: string; name_en: string; weight_percent: number; max_points: number }>)
-                          : [{ name_bn: 'বর্ণের গঠন', name_en: 'Letterform', weight_percent: 100, max_points: 100 }],
-                      })
-                    }
-                    className="px-3 py-1 text-xs rounded border border-[#4C1D95]/20 text-[#4C1D95] cursor-pointer"
-                  >
-                    Scoring Criteria
-                  </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await fetch(`/api/admin/competitions/${c.id}`, {
+                          method: 'PATCH',
+                          headers: authHeaders({ 'Content-Type': 'application/json' }),
+                          body: JSON.stringify({ results_published: c.results_published !== 1 }),
+                        });
+                        showToast('Toggled Results Publication');
+                        loadCompetitions();
+                        refreshBootstrap();
+                      }}
+                      className="px-3 py-1 text-xs rounded bg-[#7C3AED] text-white cursor-pointer"
+                    >
+                      {c.results_published === 1 ? 'Hide Results' : 'Publish Merit List'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setEditingCriteriaComp({
+                          id: Number(c.id),
+                          title: String(c.title_en || c.title_bn),
+                          criteria: Array.isArray(c.criteria) && c.criteria.length > 0
+                            ? (c.criteria as Array<{ name_bn: string; name_en: string; weight_percent: number; max_points: number }>)
+                            : [{ name_bn: 'বর্ণের গঠন', name_en: 'Letterform', weight_percent: 100, max_points: 100 }],
+                        })
+                      }
+                      className="px-3 py-1 text-xs rounded border border-[#4C1D95]/20 text-[#4C1D95] cursor-pointer"
+                    >
+                      Scoring Criteria
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
 
           <form
@@ -916,6 +1368,10 @@ export function AdminDashboardPage() {
               <input type="date" value={newComp.registration_open_date} onChange={(e) => setNewComp({ ...newComp, registration_open_date: e.target.value })} className="px-2 py-2 border rounded-lg text-xs" />
               <input type="date" value={newComp.registration_deadline} onChange={(e) => setNewComp({ ...newComp, registration_deadline: e.target.value })} className="px-2 py-2 border rounded-lg text-xs" />
               <input type="date" value={newComp.competition_date} onChange={(e) => setNewComp({ ...newComp, competition_date: e.target.value })} className="px-2 py-2 border rounded-lg text-xs" />
+            </div>
+            <div>
+              <label className="block text-[11px] font-semibold text-[#4C1D95]/75 mb-1">Registration Fee (BDT)</label>
+              <input type="number" min={0} value={newComp.registration_fee} onChange={(e) => setNewComp({ ...newComp, registration_fee: Number(e.target.value || 0) })} className="w-full px-3 py-2 border rounded-lg text-xs font-mono" />
             </div>
             <input type="text" placeholder="Initial Category (Bangla)" value={newComp.cat_bn} onChange={(e) => setNewComp({ ...newComp, cat_bn: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-xs" />
             <input type="text" placeholder="Initial Category (English)" value={newComp.cat_en} onChange={(e) => setNewComp({ ...newComp, cat_en: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-xs" />
@@ -2291,6 +2747,149 @@ export function AdminDashboardPage() {
                   <span className="font-mono text-[#4C1D95]/60">{String(log.created_at)}</span>
                 </div>
               ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Detailed Participant Profile Modal */}
+      {viewingReg && (
+        <div
+          className="fixed inset-0 z-50 bg-black/65 flex items-center justify-center p-4"
+          onClick={() => setViewingReg(null)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-2xl w-full max-h-[88vh] overflow-y-auto p-6 space-y-5 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between border-b pb-3">
+              <div>
+                <p className="text-xs font-mono font-bold text-[#7C3AED]">{viewingReg.registration_id}</p>
+                <h3 className="text-lg font-bold text-[#4C1D95]">
+                  {viewingReg.name_en} ({viewingReg.name_bn})
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setViewingReg(null)}
+                className="p-1.5 rounded-lg hover:bg-slate-100 cursor-pointer"
+                aria-label="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <dl className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <div>
+                <dt className="text-slate-500">Father's Name</dt>
+                <dd className="font-semibold text-[#1E1B4B]">{viewingReg.father_name}</dd>
+              </div>
+              <div>
+                <dt className="text-slate-500">Mother's Name</dt>
+                <dd className="font-semibold text-[#1E1B4B]">{viewingReg.mother_name}</dd>
+              </div>
+              <div>
+                <dt className="text-slate-500">Date of Birth / Gender</dt>
+                <dd className="font-semibold text-[#1E1B4B]">
+                  {viewingReg.date_of_birth || '-'} · {viewingReg.gender || '-'}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-slate-500">School &amp; Class</dt>
+                <dd className="font-semibold text-[#1E1B4B]">
+                  {viewingReg.school_name} ({viewingReg.class_level})
+                </dd>
+              </div>
+              <div>
+                <dt className="text-slate-500">Mobile &amp; Email</dt>
+                <dd className="font-mono text-[#1E1B4B]">
+                  {viewingReg.mobile} {viewingReg.email ? `· ${viewingReg.email}` : ''}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-slate-500">District &amp; Address</dt>
+                <dd className="text-[#1E1B4B]">
+                  {viewingReg.district} {viewingReg.full_address ? `— ${viewingReg.full_address}` : ''}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-slate-500">Payment Method &amp; Transaction</dt>
+                <dd className="font-mono font-bold text-[#059669]">
+                  {viewingReg.payment_status || 'PENDING'} · {viewingReg.payment_method || '-'} · ৳
+                  {viewingReg.payment_amount ?? 0} ({viewingReg.transaction_id || 'N/A'})
+                </dd>
+              </div>
+              <div>
+                <dt className="text-slate-500">OTP &amp; Venue Check-In</dt>
+                <dd className="font-semibold text-[#1E1B4B]">
+                  OTP Verified: {viewingReg.otp_verified === 1 ? 'YES' : 'NO'} ·{' '}
+                  {viewingReg.attendance_marked_at
+                    ? `Checked in (${viewingReg.attendance_marked_at})`
+                    : 'Not checked in'}
+                </dd>
+              </div>
+            </dl>
+
+            {viewingReg.payment_method && ['bkash', 'nagad', 'rocket'].includes(viewingReg.payment_method) && (
+              <div className="flex items-center gap-3">
+                <PaymentMethodLogo method={viewingReg.payment_method} className="h-7 w-auto" />
+                {viewingReg.is_test_payment === 1 && (
+                  <span className="text-[11px] font-bold text-amber-800 bg-amber-100 px-2.5 py-1 rounded">
+                    Sandbox Test Transaction
+                  </span>
+                )}
+              </div>
+            )}
+
+            {viewingReg.sample_file_url && (
+              <div className="p-3.5 rounded-xl bg-slate-50 border text-xs space-y-2">
+                <p className="font-bold text-[#4C1D95]">Uploaded Handwriting Sample:</p>
+                {viewingReg.sample_file_url.toLowerCase().endsWith('.pdf') ? (
+                  <a
+                    href={viewingReg.sample_file_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[#7C3AED] font-bold underline"
+                  >
+                    Open Submitted PDF Sample
+                  </a>
+                ) : (
+                  <img
+                    src={viewingReg.sample_file_url}
+                    alt="Participant handwriting sample"
+                    className="max-h-56 rounded-lg border object-contain"
+                  />
+                )}
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-2 pt-3 border-t">
+              {viewingReg.qr_token && (
+                <button
+                  type="button"
+                  onClick={() => navigate(`/verify/${encodeURIComponent(viewingReg.qr_token || '')}`)}
+                  className="px-3.5 py-2 bg-[#059669] text-white text-xs font-bold rounded-lg cursor-pointer"
+                >
+                  Open Verify URL
+                </button>
+              )}
+              {viewingReg.payment_status === 'PAID' && viewingReg.qr_revoked !== 1 && viewingReg.qr_token && (
+                <a
+                  href={`/api/public/registrations/${encodeURIComponent(
+                    viewingReg.registration_id
+                  )}/entry-pass.pdf?token=${encodeURIComponent(viewingReg.qr_token)}`}
+                  className="px-3.5 py-2 bg-[#4C1D95] text-white text-xs font-bold rounded-lg"
+                >
+                  Download Entry Pass PDF
+                </a>
+              )}
+              <button
+                type="button"
+                onClick={() => setViewingReg(null)}
+                className="px-3.5 py-2 border rounded-lg text-xs font-semibold cursor-pointer ml-auto"
+              >
+                Close
+              </button>
             </div>
           </div>
         </div>

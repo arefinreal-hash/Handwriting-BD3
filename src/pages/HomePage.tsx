@@ -248,6 +248,120 @@ export function HomePage() {
         </div>
       </section>
 
+      {/* 2B. HANDWRITING COMPETITION 2026 REGISTRATION BANNER */}
+      {(() => {
+        const bannerComp = upcomingComp || featuredComp;
+        const isRegOpen = Boolean(
+          bannerComp &&
+            bannerComp.status === 'published' &&
+            (!countdown || !countdown.expired)
+        );
+        const compFee = Number(bannerComp?.registration_fee ?? 200);
+        const deadlineStr = bannerComp?.registration_deadline || '2026-11-30';
+
+        return (
+          <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mb-14">
+            <motion.div
+              initial={{ opacity: 0, y: 14 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true }}
+              transition={{ duration: 0.35 }}
+              whileHover={{ y: -2 }}
+              className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-[#FBF9F3] via-white to-[#ECFDF5] dark:from-[#0A2620] dark:via-[#071D18] dark:to-[#0E2E26] border border-[#E5C158]/45 dark:border-[#2DD4BF]/30 shadow-lg shadow-[#04241D]/10 p-6 sm:p-8 lg:p-10"
+            >
+              <div
+                aria-hidden="true"
+                className="absolute -right-12 -top-12 w-56 h-56 rounded-full bg-[#E5C158]/15 blur-2xl pointer-events-none"
+              />
+              <div
+                aria-hidden="true"
+                className="absolute -left-10 -bottom-12 w-52 h-52 rounded-full bg-[#2DD4BF]/15 blur-2xl pointer-events-none"
+              />
+
+              <div className="relative z-10 grid grid-cols-1 lg:grid-cols-12 gap-7 items-center">
+                <div className="lg:col-span-8 space-y-3.5">
+                  <div className="flex flex-wrap items-center gap-3 text-xs font-bold">
+                    <span className="inline-flex items-center gap-2 text-[#065F46] dark:text-[#5EEAD4]">
+                      <span
+                        className={`w-2.5 h-2.5 rounded-full ${
+                          isRegOpen ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'
+                        }`}
+                      />
+                      <span>
+                        {isRegOpen
+                          ? t('নিবন্ধন চলছে · Registration Open', 'Registration Open')
+                          : t('নিবন্ধন বন্ধ · Registration Closed', 'Registration Closed')}
+                      </span>
+                    </span>
+                    <span className="text-[#1E1B4B]/30 dark:text-white/25">·</span>
+                    <span className="text-[#92400E] dark:text-[#F3D98B] inline-flex items-center gap-1.5">
+                      <Calendar className="w-3.5 h-3.5" />
+                      <span>
+                        {t(`শেষ তারিখ: ${deadlineStr}`, `Registration Deadline: ${deadlineStr}`)}
+                      </span>
+                    </span>
+                    <span className="text-[#1E1B4B]/30 dark:text-white/25">·</span>
+                    <span className="font-mono font-extrabold text-[#05241D] dark:text-white">
+                      {t(`নিবন্ধন ফি: ৳${compFee} BDT`, `Competition Fee: ৳${compFee} BDT`)}
+                    </span>
+                  </div>
+
+                  <div className="space-y-1">
+                    <h2 className="text-2xl sm:text-3xl lg:text-4xl font-extrabold text-[#04241D] dark:text-[#F3D98B] font-display tracking-tight flex items-center gap-2.5">
+                      <span aria-hidden="true">✍️</span>
+                      <span>
+                        {t(
+                          'হ্যান্ডরাইটিং কম্পিটিশন ২০২৬ · Handwriting Competition 2026',
+                          'Handwriting Competition 2026'
+                        )}
+                      </span>
+                    </h2>
+                    <p className="text-base sm:text-lg font-bold text-[#0D9488] dark:text-[#5EEAD4]">
+                      {t(
+                        'আপনার হাতের লেখার প্রতিভা তুলে ধরুন! · Showcase Your Handwriting Talent!',
+                        'Showcase Your Handwriting Talent!'
+                      )}
+                    </p>
+                  </div>
+
+                  <p className="text-sm sm:text-base text-[#1E1B4B]/80 dark:text-white/80 max-w-2xl leading-relaxed">
+                    {t(
+                      'হ্যান্ডরাইটিং কম্পিটিশনে অংশ নিয়ে আপনার সৃজনশীলতা, শৈল্পিক দক্ষতা ও পরিচ্ছন্ন হস্তলিপির উৎকর্ষ প্রমাণ করুন। অনলাইন নিবন্ধন, নিরাপদ মোবাইল পেমেন্ট এবং যাচাইকৃত QR এন্ট্রি পাস ও সনদপত্র পান।',
+                      'Join our handwriting competition and showcase your creativity, skill and handwriting excellence. Complete registration online with secure mobile payment and receive your official QR-verified Entry Pass.'
+                    )}
+                  </p>
+                </div>
+
+                <div className="lg:col-span-4 flex flex-col sm:flex-row lg:flex-col items-stretch sm:items-center lg:items-end justify-center gap-3">
+                  <button
+                    type="button"
+                    disabled={!isRegOpen}
+                    onClick={() =>
+                      navigate(bannerComp ? `/register?competition=${bannerComp.id}` : '/register')
+                    }
+                    className="group inline-flex items-center justify-center gap-2.5 px-7 py-4 bg-gradient-to-r from-[#05241D] to-[#0D9488] dark:from-[#F3D98B] dark:to-[#E5C158] text-white dark:text-[#04241D] font-extrabold text-sm sm:text-base rounded-2xl shadow-lg shadow-[#05241D]/20 hover:shadow-xl hover:scale-[1.01] disabled:opacity-50 disabled:cursor-not-allowed transition-all cursor-pointer"
+                  >
+                    <span>
+                      {isRegOpen
+                        ? t('কম্পিটিশনে অংশগ্রহণ করুন / Register Now', 'Register Now')
+                        : t('নিবন্ধন সময়সীমা শেষ', 'Registration Closed')}
+                    </span>
+                    <ArrowRight className="w-4 h-4 transition-transform group-hover:translate-x-1" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => navigate('/verify')}
+                    className="inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl border border-[#05241D]/20 dark:border-[#2DD4BF]/30 text-xs font-bold text-[#05241D] dark:text-[#CCFBF1] hover:bg-[#05241D]/5 dark:hover:bg-white/5 transition-colors cursor-pointer"
+                  >
+                    <span>{t('এন্ট্রি পাস বা সনদ যাচাই করুন', 'Verify Entry Pass / Certificate')}</span>
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </section>
+        );
+      })()}
+
       {/* 3. PROGRAMS & ACTIVITIES SECTION (ZemeZ Pastel Rounded Cards) */}
       <section id="programs" className="py-14 lg:py-20 bg-white dark:bg-[#0A1C18]">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">

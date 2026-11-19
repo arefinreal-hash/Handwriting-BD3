@@ -31,6 +31,7 @@ export interface Competition {
   registration_open_date: string;
   registration_deadline: string;
   competition_date: string;
+  registration_fee?: number;
   eligibility_bn: string;
   eligibility_en: string;
   rules_bn: string;
@@ -370,3 +371,56 @@ export const AWARD_LABELS: Record<string, { bn: string; en: string }> = {
   merit: { bn: 'মেধা ও অংশগ্রহণ সনদ', en: 'Merit & Participation' },
   none: { bn: 'অংশগ্রহণকারী', en: 'Participant' },
 };
+
+export interface EntryPassVerifyResponse {
+  organization: string;
+  result_status: 'AUTHENTIC' | 'INVALID' | 'REVOKED' | 'PENDING';
+  headline: string;
+  headline_bn: string;
+  verified_at: string;
+  pass: {
+    registration_id: string;
+    participant_name_en: string;
+    participant_name_bn: string;
+    institution_name: string;
+    class_level: string;
+    competition_title_en: string;
+    competition_title_bn: string;
+    competition_year: string;
+    category_name_en: string;
+    category_name_bn: string;
+    registration_status: string;
+    payment_status: string;
+    is_test_payment: boolean;
+    revoked: boolean;
+    revoked_reason?: string;
+  } | null;
+}
+
+export interface PaymentConfirmationInfo {
+  registration_id: string;
+  name_bn: string;
+  name_en: string;
+  school_name: string;
+  class_level: string;
+  district: string;
+  status: string;
+  payment_method: 'bkash' | 'nagad' | 'rocket' | 'free';
+  payment_status: string;
+  payment_amount: number;
+  transaction_id: string;
+  is_test_payment: number;
+  otp_verified: number;
+  qr_token: string;
+  qr_revoked: number;
+  created_at: string;
+  comp_bn: string;
+  comp_en: string;
+  competition_date: string;
+  cat_bn: string;
+  cat_en: string;
+  email_dispatch_status?: string;
+  verify_url: string;
+  qr_data_url: string;
+}
+
