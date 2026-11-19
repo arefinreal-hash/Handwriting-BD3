@@ -1,0 +1,6 @@
+{
+  "name": "Handwriting & Calligraphy Foundation of Bangladesh (HCFB)",
+  "description": "হ্যান্ডরাইটিং এন্ড ক্যালিগ্রাফি ফাউন্ডেশন অব বাংলাদেশ — সুন্দর হাতের লেখা ও ক্যালিগ্রাফি চর্চা, জাতীয় প্রতিযোগিতা নিবন্ধন, সনদ যাচাই এবং সৃজনশীল শিক্ষামূলক প্ল্যাটফর্ম।",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

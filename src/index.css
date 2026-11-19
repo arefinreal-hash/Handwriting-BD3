@@ -1,0 +1,71 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "Hind Siliguri", "Nunito", system-ui, -apple-system, sans-serif;
+  --font-display: "Poppins", "Hind Siliguri", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --color-royal-purple: #4C1D95;
+  --color-royal-violet: #7C3AED;
+  --color-warm-pink: #EC4899;
+  --color-elegant-blue: #2563EB;
+  --color-cream: #FFFBF5;
+  --color-lavender-soft: #F5F3FF;
+  --color-mint-soft: #ECFDF5;
+  --color-peach-soft: #FFF7ED;
+  --color-emerald-deep: #05241D;
+  --color-teal-dark: #0A362C;
+  --color-gold-champagne: #E5C158;
+  --color-aqua-glow: #14B8A6;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    font-family: "Hind Siliguri", "Nunito", system-ui, sans-serif;
+  }
+
+  body {
+    background-color: #FFFBF5;
+    color: #1E1B4B;
+    overflow-x: hidden;
+    transition: background-color 200ms ease, color 200ms ease;
+  }
+
+  html.dark body {
+    background-color: #071412;
+    color: #ECFDF5;
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: "Poppins", "Hind Siliguri", system-ui, sans-serif;
+    text-wrap: balance;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #ffffff !important;
+    color: #000000 !important;
+  }
+  .print-only-card {
+    box-shadow: none !important;
+    border: 1px solid #cbd5e1 !important;
+  }
+}
